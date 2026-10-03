@@ -1,0 +1,86 @@
+name: Release
+
+# Push a `v*` tag to build every target and publish the archives to the GitHub
+# Release. Pull requests and manual runs build the same matrix but only upload
+# the artifacts (no release is touched).
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x64 / aarch64 / armv7, statically linked against musl so the archive
+          # runs on any Linux (routers, old glibc, containers) with no runtime deps.
+          - target: x86_64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
+          - target: armv7-unknown-linux-musleabihf
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry & target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # cross provides the target sysroot + cross linker in a Docker image;
+      # GitHub-hosted Ubuntu runners already have Docker.
+      - name: Install cross
+        uses: taiki-e/install-action@cross
+
+      - name: Build
+        env:
+          RUSTFLAGS: -C strip=symbols
+        run: cross build --locked --release --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [ "${version}" = "${GITHUB_REF_NAME}" ] && version="${GITHUB_SHA::7}"
+          pkg="shadowvpn-${version}-${{ matrix.target }}"
+          mkdir -p "${pkg}"
+          for b in shadowvpn-server shadowvpn-client; do
+            cp "target/${{ matrix.target }}/release/${b}" "${pkg}/"
+          done
+          cp README.md LICENSE "${pkg}/"
+          tar -czf "${pkg}.tar.gz" "${pkg}"
+          sha256sum "${pkg}.tar.gz" | tee "${pkg}.tar.gz.sha256"
+          echo "PKG=${pkg}" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shadowvpn-${{ matrix.target }}
+          path: |
+            ${{ env.PKG }}.tar.gz
+            ${{ env.PKG }}.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Publish to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          files: |
+            ${{ env.PKG }}.tar.gz
+            ${{ env.PKG }}.tar.gz.sha256
