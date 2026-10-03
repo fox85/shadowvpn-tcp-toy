@@ -92,13 +92,6 @@ serde_json = "1.0"
 # UDP socket construction with enlarged SO_RCVBUF/SO_SNDBUF (cross-platform).
 socket2 = "0.6"
 
-# Raw setsockopt for the TCP carrier: congestion-control selection
-# (TCP_CONGESTION) and the unsent-bytes watermark (TCP_NOTSENT_LOWAT). None of
-# these are exposed by `socket2`, and they are the single biggest lever on
-# throughput for a tunnel carrying its own congestion-controlled traffic.
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2"
-
 # Randomness (per-datagram salt).
 rand = "0.10"
 
@@ -107,6 +100,10 @@ log = "0.4"
 env_logger = "0.11"
 maxminddb = "0.28.1"
 ipnetwork = { version = "0.21.1", features = ["serde"] }
+# Raw setsockopt for the TCP carrier: congestion control (TCP_CONGESTION) and
+# the unsent-bytes watermark (TCP_NOTSENT_LOWAT). Neither is exposed by
+# `socket2`, and both are only reachable on Linux — the call sites are
+# `cfg`-gated, so one unconditional dependency is enough.
 libc = "0.2.186"
 
 # Config import/export as a `shadowvpn://` URI + QR code. Optional: gated by the
