@@ -690,7 +690,7 @@ async fn net_to_tun(
         let mut recv_failures: u64 = 0;
         loop {
             let n = match socket.recv(&mut buf).await {
-                Ok(n) => n,
+                Ok((n, _peer)) => n,
                 // A transient path error (typically an ICMP unreachable queued
                 // on the connected socket) is retried, with a breather so a
                 // persistent condition doesn't spin this loop.
