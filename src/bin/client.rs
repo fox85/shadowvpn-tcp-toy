@@ -167,9 +167,11 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
     // UDP needs an explicit `connect()` so the relay loops can use send/recv
     // without a per-call address; TCP instead dials the server here, and
     // reconnects transparently afterwards if the connection drops.
+    let subflows = cfg.subflows;
     let transport = if cfg.transport.is_tcp() {
         drop(udp_socket); // unused on the TCP path
-        Transport::tcp_client(server_addr).await
+        info!("opening {subflows} parallel TCP subflow(s) to the server");
+        Transport::tcp_client(server_addr, subflows).await
     } else {
         udp_socket.connect(server_addr).await?;
         Ok(Transport::udp(udp_socket))
@@ -619,9 +621,15 @@ async fn tun_to_net(
                 None => datagram,
             };
 
+            // Pick the subflow *before* encryption hashes happened on plaintext:
+            // `flow_hash` reads the inner 5-tuple, so both directions of one
+            // inner connection land on the same TCP connection (keeping them in
+            // order) while unrelated connections spread across subflows.
+            let flow = shadowvpn::transport::flow_hash(&pkt);
+
             // A transient path error drops this packet (the peers' transport
             // protocols retransmit); anything else is fatal.
-            if let Err(e) = socket.send(&wire).await {
+            if let Err(e) = socket.send_on(&wire, flow).await {
                 if is_transient_udp_error(&e) {
                     send_failures += 1;
                     if send_failures == 1 {
@@ -689,6 +697,8 @@ async fn net_to_tun(
         // warn once when a burst starts, then stay quiet until it clears.
         let mut recv_failures: u64 = 0;
         loop {
+            // `recv` reports the peer it came from; the client has exactly one
+            // peer (the server), so the address is informational only.
             let n = match socket.recv(&mut buf).await {
                 Ok((n, _peer)) => n,
                 // A transient path error (typically an ICMP unreachable queued
@@ -842,7 +852,10 @@ async fn keepalive_loop(
                 Some(ref o) => o.wrap(&datagram),
                 None => datagram,
             };
-            if let Err(e) = socket.send(&wire).await {
+            // Keepalives go out on *every* subflow: each connection has its own
+            // NAT mapping and its own idle timer, so refreshing only one would
+            // let the rest expire and get reaped by the peer.
+            if let Err(e) = socket.send_all(&wire).await {
                 if is_transient_udp_error(&e) {
                     warn!("transient keepalive send error, retrying next tick: {e}");
                     continue;
@@ -872,6 +885,8 @@ async fn send_control(
         Some(o) => o.wrap(&datagram),
         None => datagram,
     };
+    // Control traffic is tiny and rare — one subflow is plenty, and keeping it
+    // on a fixed one means the server learns that endpoint first.
     if let Err(e) = socket.send(&wire).await {
         if is_transient_udp_error(&e) {
             warn!("transient control send error: {e}");

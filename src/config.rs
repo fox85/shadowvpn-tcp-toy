@@ -104,6 +104,19 @@ impl std::fmt::Display for TransportKind {
     }
 }
 
+/// Default number of parallel TCP connections a client opens (`transport: "tcp"`).
+///
+/// A single TCP connection's throughput is capped by its receive window divided
+/// by the RTT; four connections let the client use four windows' worth, which is
+/// what gets a long-fat path past a hundred megabits. Ignored on UDP, where
+/// there are no connections — and forced to 1 in server NAT mode, which keys
+/// clients by endpoint.
+pub const DEFAULT_SUBFLOWS: usize = 4;
+
+/// Upper bound on `subflows`. Past ~16 the per-connection overhead outweighs
+/// the extra window, and the server caps its per-client endpoint table anyway.
+pub const MAX_SUBFLOWS: usize = 16;
+
 /// Default TUN netmask (a /24).
 pub const DEFAULT_NETMASK: Ipv4Addr = Ipv4Addr::new(255, 255, 255, 0);
 
@@ -227,6 +240,13 @@ pub struct FileConfig {
     /// AEAD cipher name (e.g. `"aes-256-gcm"`), or `"none"` for no encryption.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cipher: Option<String>,
+
+    /// Number of parallel TCP connections the client opens (default
+    /// [`DEFAULT_SUBFLOWS`], max [`MAX_SUBFLOWS`]). Ignored on UDP and on the
+    /// server. Must match the server's expectation only in the sense that the
+    /// server learns as many endpoints as the client opens.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subflows: Option<usize>,
 
     /// Carrier protocol: `"udp"` (default) or `"tcp"`. Must match the other end.
     ///
@@ -479,6 +499,9 @@ pub struct ClientConfig {
     /// Carrier protocol: UDP (datagram) or TCP (stream, length-prefixed).
     /// Must match the server.
     pub transport: TransportKind,
+    /// Parallel TCP connections to open when `transport` is TCP. Always 1 on
+    /// UDP (no connections) and in server NAT mode (clients keyed by endpoint).
+    pub subflows: usize,
     /// Negotiated AEAD cipher (`Cipher::None` disables encryption).
     pub cipher: Cipher,
     /// `EVP_BytesToKey`-derived master key (length == `cipher.key_len()`).
@@ -631,6 +654,12 @@ pub struct ClientArgs {
     #[arg(short = 't', long = "transport", value_name = "udp|tcp")]
     pub transport: Option<String>,
 
+    /// Parallel TCP connections to open (transport=tcp only, default
+    /// DEFAULT_SUBFLOWS, max MAX_SUBFLOWS). Raises aggregate throughput on
+    /// high-bandwidth-delay-product paths.
+    #[arg(long = "subflows", value_name = "N")]
+    pub subflows: Option<usize>,
+
     /// Explicit TUN interface name.
     #[arg(long = "tun-name")]
     pub tun_name: Option<String>,
@@ -739,6 +768,28 @@ pub struct ClientArgs {
     /// Suffix for Magic DNS names (default `svpn`).
     #[arg(long = "magic-dns-suffix")]
     pub magic_dns_suffix: Option<String>,
+}
+
+/// Resolve the number of parallel TCP subflows.
+///
+/// Always 1 on UDP: there is one datagram socket, not N connections. On TCP the
+/// value is clamped to [`MAX_SUBFLOWS`] (and floored at 1, since a "zero
+/// connection" client would be a client that never connects).
+fn resolve_subflows(subflows: Option<usize>, transport: TransportKind) -> Result<usize, ConfigError> {
+    if !transport.is_tcp() {
+        return Ok(1);
+    }
+    match subflows.unwrap_or(DEFAULT_SUBFLOWS) {
+        0 => Err(ConfigError::Invalid {
+            field: "subflows",
+            message: "must be at least 1".to_string(),
+        }),
+        n if n > MAX_SUBFLOWS => Err(ConfigError::Invalid {
+            field: "subflows",
+            message: format!("must be at most {MAX_SUBFLOWS}, got {n}"),
+        }),
+        n => Ok(n),
+    }
 }
 
 /// Load the optional file config referenced by a `--config` path.
@@ -1267,6 +1318,7 @@ impl ClientArgs {
             .ok_or(ConfigError::Missing("server"))?;
 
         let transport = resolve_transport(self.transport.or(file.transport))?;
+        let subflows = resolve_subflows(self.subflows.or(file.subflows), transport)?;
 
         let (cipher, master_key) =
             resolve_crypto(self.cipher.or(file.cipher), self.password.or(file.password))?;
@@ -1314,6 +1366,7 @@ impl ClientArgs {
         Ok(ClientConfig {
             server,
             transport,
+            subflows,
             cipher,
             master_key,
             tun,
@@ -1464,6 +1517,7 @@ mod tests {
                 password: None,
                 cipher: None,
                 transport: None,
+                subflows: None,
                 tun_name: None,
                 tun_ip: None,
                 tun_netmask: None,
@@ -1595,6 +1649,61 @@ mod tests {
         tcp.tun_ip = Some(Ipv4Addr::new(10, 0, 0, 2));
         tcp.peer_ip = Some(Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(tcp.resolve().unwrap().transport, TransportKind::Tcp);
+    }
+
+    #[test]
+    fn subflows_default_and_bounds() {
+        let base = || ClientArgs {
+            config: None,
+            server: Some("host:1".to_string()),
+            password: Some("pw".to_string()),
+            transport: Some("tcp".to_string()),
+            tun_ip: Some(Ipv4Addr::new(10, 0, 0, 2)),
+            peer_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            ..ClientArgs::empty()
+        };
+
+        // Unspecified => the default, and it only applies to TCP.
+        assert_eq!(base().resolve().unwrap().subflows, DEFAULT_SUBFLOWS);
+        let udp = ClientArgs {
+            transport: Some("udp".to_string()),
+            subflows: Some(8),
+            ..base()
+        };
+        assert_eq!(udp.resolve().unwrap().subflows, 1, "udp ignores subflows");
+
+        // In-range values pass through.
+        let many = ClientArgs {
+            subflows: Some(MAX_SUBFLOWS),
+            ..base()
+        };
+        assert_eq!(many.resolve().unwrap().subflows, MAX_SUBFLOWS);
+    }
+
+    #[test]
+    fn out_of_range_subflows_are_rejected() {
+        let base = || ClientArgs {
+            config: None,
+            server: Some("host:1".to_string()),
+            password: Some("pw".to_string()),
+            transport: Some("tcp".to_string()),
+            tun_ip: Some(Ipv4Addr::new(10, 0, 0, 2)),
+            peer_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            ..ClientArgs::empty()
+        };
+        for n in [0, MAX_SUBFLOWS + 1] {
+            let args = ClientArgs {
+                subflows: Some(n),
+                ..base()
+            };
+            assert!(
+                matches!(
+                    args.resolve(),
+                    Err(ConfigError::Invalid { field: "subflows", .. })
+                ),
+                "subflows={n} must be rejected"
+            );
+        }
     }
 
     #[test]

@@ -48,6 +48,31 @@ TCP is a good fit when UDP is blocked, rate-limited, or NAT-unfriendly, and a
 bad fit for latency-sensitive traffic: TCP-in-TCP means a lost outer segment
 stalls every inner flow until it is retransmitted.
 
+### Tuning TCP throughput
+
+A single TCP connection's throughput is bounded roughly by
+
+```text
+throughput <= receive_window / RTT
+```
+
+so a 4 MB window on a 200 ms path tops out well under 200 Mbit/s no matter how
+fast the link is. Two mechanisms lift that ceiling:
+
+* **Large socket buffers.** Both ends request 4 MiB `SO_RCVBUF`/`SO_SNDBUF`
+  (best-effort; the OS may clamp).
+* **Parallel subflows.** `--subflows N` (default 4, max 16) opens `N` TCP
+  connections and spreads inner connections across them by a 5-tuple hash, so
+  the client uses `N` windows' worth of bandwidth. One inner connection always
+  maps to the same subflow, so its packets stay in order.
+
+With 4 subflows and 4 MiB buffers, aggregate throughput scales roughly with
+`N` until the link or the CPU saturates. Keepalives go out on every subflow so
+none of them expires from idleness.
+
+Server NAT mode (`--nat`) keys clients by endpoint, so a multi-subflow client
+would look like several clients: **use `subflows=1` with NAT.**
+
 ## Disabling encryption (`cipher: "none"`)
 
 ```json

@@ -52,10 +52,25 @@ use shadowvpn::transport::Transport;
 use shadowvpn::tun_device::TunDevice;
 
 /// One learned inner-IP → UDP mapping, live only within `lease_ttl`.
+/// One learned client.
+///
+/// A client may be reachable through several endpoints at once: on the TCP
+/// carrier it opens one connection per subflow, and the server sees each as a
+/// separate peer. They all belong to the same tunnel IP, so we keep them all
+/// and pick one per packet (see [`Learned::lookup`]) — that is what lets the
+/// parallel subflows carry return traffic in parallel instead of funnelling
+/// everything back down one connection.
 struct ClientEntry {
-    peer: SocketAddr,
+    /// Every endpoint this client is currently reachable via.
+    peers: Vec<SocketAddr>,
     last_seen: Instant,
 }
+
+/// Cap on how many endpoints one client can be learned on.
+///
+/// Bounds the table against a peer that sprays packets from many ports; a
+/// legitimate client uses at most its configured `subflows` (default 4).
+const MAX_PEERS_PER_CLIENT: usize = 16;
 
 /// Learning-mode routing state: the classic per-address client map plus the
 /// mesh subnet-route table (Tailscale-like advertised routes).
@@ -72,35 +87,49 @@ impl Learned {
     /// Refreshes `last_seen` so a quiet-but-still-sending client stays live.
     fn learn(&mut self, src: IpAddr, peer: SocketAddr, via: &str) {
         let now = Instant::now();
-        match self.clients.get_mut(&src) {
-            Some(entry) if entry.peer == peer => {
-                entry.last_seen = now;
+        if let Some(entry) = self.clients.get_mut(&src) {
+            entry.last_seen = now;
+            if entry.peers.contains(&peer) {
+                return; // already known on this endpoint
             }
-            _ => {
-                if self
-                    .clients
-                    .insert(
-                        src,
-                        ClientEntry {
-                            peer,
-                            last_seen: now,
-                        },
-                    )
-                    .map(|e| e.peer)
-                    != Some(peer)
-                {
-                    info!("client {src} reachable via {peer}{via}");
-                }
+            if entry.peers.len() < MAX_PEERS_PER_CLIENT {
+                entry.peers.push(peer);
+                info!("client {src} also reachable via {peer}{via}");
+            } else {
+                // Table is full: recycle the oldest slot rather than dropping
+                // the newest endpoint, which is the one actually sending.
+                entry.peers.remove(0);
+                entry.peers.push(peer);
+                debug!("client {src} peer list full; replaced oldest with {peer}");
             }
+            return;
         }
+        self.clients.insert(
+            src,
+            ClientEntry {
+                peers: vec![peer],
+                last_seen: now,
+            },
+        );
+        info!("client {src} reachable via {peer}{via}");
     }
 
     /// Resolve an inner destination: exact *live* client first, then the
     /// longest-prefix subnet route.
-    fn lookup(&self, dst: IpAddr, now: Instant, ttl: Duration) -> Option<SocketAddr> {
+    /// Resolve an inner destination to the peer that should receive it.
+    ///
+    /// When a client is known on several endpoints (its parallel subflows),
+    /// `flow` picks one deterministically: the same inner connection always
+    /// maps to the same subflow, so its packets stay in order, while unrelated
+    /// connections spread across subflows and share the aggregate throughput.
+    fn lookup(&self, dst: IpAddr, flow: u32, now: Instant, ttl: Duration) -> Option<SocketAddr> {
         if let Some(entry) = self.clients.get(&dst) {
             if now.saturating_duration_since(entry.last_seen) <= ttl {
-                return Some(entry.peer);
+                let n = entry.peers.len();
+                if n == 0 {
+                    return None;
+                }
+                return Some(entry.peers[(flow % n as u32) as usize]);
             }
         }
         self.subnets.lookup(dst)
@@ -123,8 +152,15 @@ impl Learned {
             return;
         };
         let live = now.saturating_duration_since(entry.last_seen) <= ttl;
-        if last_peer == Some(entry.peer) || !live {
+        // With several endpoints per client, only drop the mapping when the
+        // caller's endpoint is the *last* one left (or the mapping is dead) —
+        // otherwise a single subflow going away would evict a live client.
+        let last_one = entry.peers.len() <= 1;
+        let matches = last_peer.map_or(false, |p| entry.peers.contains(&p));
+        if !live || (matches && last_one) {
             self.clients.remove(&ip);
+        } else if matches {
+            entry.peers.retain(|p| Some(*p) != last_peer);
         }
     }
 }
@@ -450,7 +486,11 @@ async fn udp_to_tun(
                             debug!("datagram from {peer} is not a parseable IP packet; forwarding");
                         }
                         match ip_dst(&plaintext)
-                            .and_then(|dst| state.learned.lookup(dst, now, cfg.lease_ttl))
+                            .and_then(|dst| {
+                                state
+                                    .learned
+                                    .lookup(dst, shadowvpn::transport::flow_hash(&plaintext), now, cfg.lease_ttl)
+                            })
                         {
                             // Spoke↔spoke: relay UDP→UDP without touching TUN.
                             Some(next) if next != peer => Action::Relay(next),
@@ -548,7 +588,10 @@ async fn tun_to_udp(
                 let mut guard = routing.lock().unwrap();
                 match &mut *guard {
                     Routing::Learn(state) => {
-                        ip_dst(&pkt).and_then(|dst| state.learned.lookup(dst, now, cfg.lease_ttl))
+                        // Hash the *plaintext* so both directions of one inner
+                        // connection pick the same subflow.
+                        let flow = shadowvpn::transport::flow_hash(&pkt);
+                        ip_dst(&pkt).and_then(|dst| state.learned.lookup(dst, flow, now, cfg.lease_ttl))
                     }
                     Routing::Nat(nat) => nat.egress(&mut pkt, now),
                 }
@@ -975,7 +1018,16 @@ fn print_banner(cfg: &ServerConfig, tun_name: &str) {
         warn!("  ENCRYPTION     : DISABLED (cipher=none) - traffic is plaintext and unauthenticated");
     }
     if cfg.transport.is_tcp() {
-        info!("  carrier        : TCP, one connection per client, 2-byte length-prefixed frames");
+        info!(
+            "  carrier        : TCP, length-prefixed frames; each client may open several parallel connections"
+        );
+        if cfg.nat {
+            // NAT mode can't tell "two connections from one client" from "two
+            // clients", so a multi-subflow client would get two internal IPs.
+            warn!(
+                "  NAT + TCP      : clients MUST use subflows=1 (NAT keys clients by endpoint)"
+            );
+        }
     }
     info!(
         "  TUN interface  : {tun_name} ip={} netmask={} peer={} mtu={}",
@@ -1136,15 +1188,15 @@ mod tests {
 
         // Exact client match beats the covering subnet route…
         assert_eq!(
-            learned.lookup("10.77.0.2".parse().unwrap(), now, ttl),
+            learned.lookup("10.77.0.2".parse().unwrap(), 0, now, ttl),
             Some(peer_a)
         );
         // …and everything else in the subnet goes to its advertiser.
         assert_eq!(
-            learned.lookup("10.77.9.9".parse().unwrap(), now, ttl),
+            learned.lookup("10.77.9.9".parse().unwrap(), 0, now, ttl),
             Some(peer_b)
         );
-        assert_eq!(learned.lookup("192.0.2.1".parse().unwrap(), now, ttl), None);
+        assert_eq!(learned.lookup("192.0.2.1".parse().unwrap(), 0, now, ttl), None);
     }
 
     #[test]
@@ -1154,11 +1206,11 @@ mod tests {
         let ip: IpAddr = "10.77.0.2".parse().unwrap();
         learned.learn(ip, peer, "");
         let ttl = Duration::from_secs(120);
-        assert_eq!(learned.lookup(ip, Instant::now(), ttl), Some(peer));
+        assert_eq!(learned.lookup(ip, 0, Instant::now(), ttl), Some(peer));
 
         learned.clients.get_mut(&ip).unwrap().last_seen = Instant::now() - Duration::from_secs(121);
         let now = Instant::now();
-        assert_eq!(learned.lookup(ip, now, ttl), None);
+        assert_eq!(learned.lookup(ip, 0, now, ttl), None);
         learned.expire_clients(ttl, now);
         assert!(learned.clients.is_empty());
     }
@@ -1215,22 +1267,22 @@ mod tests {
         };
         let ttl = state.lease_ttl;
         assert_eq!(
-            state.learned.lookup("10.77.0.2".parse().unwrap(), now, ttl),
+            state.learned.lookup("10.77.0.2".parse().unwrap(), 0, now, ttl),
             Some(router_peer)
         );
         assert_eq!(
-            state.learned.lookup("fd07:7::2".parse().unwrap(), now, ttl),
+            state.learned.lookup("fd07:7::2".parse().unwrap(), 0, now, ttl),
             Some(router_peer)
         );
         assert_eq!(
             state
                 .learned
-                .lookup("192.168.200.7".parse().unwrap(), now, ttl),
+                .lookup("192.168.200.7".parse().unwrap(), 0, now, ttl),
             Some(router_peer)
         );
         // The unapproved route is not routable.
         assert_eq!(
-            state.learned.lookup("10.99.1.1".parse().unwrap(), now, ttl),
+            state.learned.lookup("10.99.1.1".parse().unwrap(), 0, now, ttl),
             None
         );
     }
@@ -1275,7 +1327,7 @@ mod tests {
                 panic!("learn")
             };
             assert_eq!(
-                state.learned.lookup(IpAddr::V4(ip), now, state.lease_ttl),
+                state.learned.lookup(IpAddr::V4(ip), 0, now, state.lease_ttl),
                 Some(peer)
             );
         }
@@ -1346,7 +1398,7 @@ mod tests {
             assert_eq!(
                 state
                     .learned
-                    .lookup(IpAddr::V4(reply.tun_ip), now, state.lease_ttl),
+                    .lookup(IpAddr::V4(reply.tun_ip), 0, now, state.lease_ttl),
                 Some(peer)
             );
             assert_eq!(state.assigner.node_for_peer(peer), Some(NODE_A));
@@ -1474,11 +1526,11 @@ mod tests {
         assert_eq!(
             state
                 .learned
-                .lookup(IpAddr::V4(reply.tun_ip), now, state.lease_ttl),
+                .lookup(IpAddr::V4(reply.tun_ip), 0, now, state.lease_ttl),
             Some(peer)
         );
         assert_eq!(
-            state.learned.lookup(IpAddr::V6(ip6), now, state.lease_ttl),
+            state.learned.lookup(IpAddr::V6(ip6), 0, now, state.lease_ttl),
             Some(peer)
         );
     }

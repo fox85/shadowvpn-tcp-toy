@@ -12,6 +12,7 @@ anything not supplied. Both binaries accept `-c, --config <PATH>`.
 | `password`    | `-k, --password`  | pre-shared password; master key derived from it                 | yes      | —                    |
 | `cipher`      | `-m, --cipher`    | `aes-128-gcm` \| `aes-256-gcm` \| `chacha20-poly1305` \| `none` (no encryption) | no | `chacha20-poly1305` |
 | `transport`   | `-t, --transport` | carrier protocol: `udp` \| `tcp`. Both ends must match ([see below](#transport-udp-or-tcp)) | no | `udp` |
+| `subflows`    | `--subflows`      | client-only: parallel TCP connections, `1..16` — raises aggregate throughput ([see below](#transport-udp-or-tcp)). Ignored on `udp` | no | `4` |
 | `tun_name`    | `--tun-name`      | explicit TUN interface name (e.g. `utun7`, `tun0`)              | no       | OS picks             |
 | `tun_ip`      | `--tun-ip`        | local IPv4 address on the TUN interface                         | server: yes; client: both-or-neither with `peer_ip` | — |
 | `tun_netmask` | `--tun-netmask`   | IPv4 netmask for the TUN interface                              | no       | `255.255.255.0`      |
@@ -50,6 +51,28 @@ each prefixed with a 2-byte big-endian length:
 
 Mismatched `transport` between the two ends is not negotiated — the receiver
 simply never sees a valid frame.
+
+### Throughput tuning on TCP
+
+A single connection's throughput is bounded by `receive_window / RTT`, which is
+what caps a naive TCP carrier at a few tens of megabits on a high-latency path.
+Two things lift it:
+
+- **Socket buffers:** both ends request 4 MiB `SO_RCVBUF` / `SO_SNDBUF`
+  (best-effort; the OS may clamp to `net.core.{r,w}mem_max`).
+- **Parallel subflows** (`--subflows N`, default `4`, max `16`): the client
+  opens `N` connections and picks one per packet by hashing the inner IP
+  5-tuple (`flow_hash`). One inner connection always maps to the same subflow,
+  so ordering is preserved; unrelated connections spread out and share `N`
+  windows' worth of bandwidth. Keepalives are fanned out to every subflow so
+  none expires from idleness.
+
+The server needs no configuration: it learns each client's endpoints as it sees
+traffic and picks among them with the same hash, so return traffic spreads too.
+
+**NAT mode caveat:** `--nat` keys clients by endpoint, so a client with 4
+subflows looks like 4 clients and gets 4 internal IPs. Use `subflows=1` with
+NAT mode.
 
 ## Server-only fields
 

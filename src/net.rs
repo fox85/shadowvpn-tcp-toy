@@ -31,6 +31,19 @@ use crate::policy::dns;
 /// 4 MiB comfortably covers a ~300 Mbit/s tunnel at tens of milliseconds RTT.
 pub const UDP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
+/// Requested size, in bytes, for each TCP socket's send and receive buffers.
+///
+/// This is the single most important knob for TCP throughput: a connection
+/// cannot move faster than `window / RTT`, so the OS default (~64 KiB on a
+/// typical Linux, sometimes less) pins a 30 ms-RTT path at well under 20 Mbit/s
+/// no matter how fast the link is. 4 MiB lets a single subflow reach ~1 Gbit/s
+/// at that RTT, and lets TCP's window scaling and auto-tuning do the rest.
+///
+/// Set **before** `connect()` on the client: the receive window is advertised
+/// during the handshake, so raising it afterwards is too late for the path that
+/// matters most.
+pub const TCP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
 /// Transaction id for the bootstrap server-resolution query. The socket is
 /// connected to a single upstream and only one query is in flight, so the exact
 /// value does not matter; a fixed non-zero id keeps things deterministic.
@@ -95,7 +108,39 @@ pub fn bind_tcp_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
 /// readability/writability is driven by the runtime — the `tokio::net` type is
 /// what the relay loops need, so this wraps it back into one.
 pub async fn connect_tcp_stream(addr: SocketAddr) -> std::io::Result<TcpStream> {
-    let stream = TcpStream::connect(addr).await?;
+    // Hand-rolled connect rather than `TcpStream::connect`, because the socket
+    // buffers must be raised *before* the handshake: the receive window is
+    // negotiated in the SYN, and setting SO_RCVBUF afterwards only helps the
+    // steady state, not the window scale the peer sees.
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    configure_tcp_socket(&sock)?;
+
+    sock.set_nonblocking(true)?;
+    match sock.connect(&addr.into()) {
+        Ok(()) => {}
+        // A non-blocking connect completes "in progress" (EINPROGRESS); on
+        // Windows the same condition surfaces as WOULDBLOCK.
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.raw_os_error() == Some(libc::EINPROGRESS) =>
+        {
+            // Wait for completion below.
+        }
+        Err(e) => return Err(e),
+    }
+
+    let stream = TcpStream::from_std(std::net::TcpStream::from(sock))?;
+    // Wait until the connect resolves, then surface any pending error (a
+    // refused or unreachable connect reports itself here, not above).
+    stream.writable().await?;
+    if let Some(e) = stream.take_error()? {
+        return Err(e);
+    }
     configure_tcp_stream(&stream)?;
     Ok(stream)
 }
@@ -107,7 +152,15 @@ pub async fn connect_tcp_stream(addr: SocketAddr) -> std::io::Result<TcpStream> 
 /// `TCP_NODELAY`, which turns off Nagle coalescing so each tunnelled IP packet
 /// goes out on the wire immediately.
 pub fn configure_tcp_stream(stream: &TcpStream) -> std::io::Result<()> {
+    // Turn off Nagle: tunnel traffic is a stream of small IP packets, and
+    // coalescing them adds a round trip to every interactive packet.
     stream.set_nodelay(true)?;
+    // Belt and braces: if a socket reached us through a path that skipped
+    // `configure_tcp_socket`, raise the buffers here as well. Late is worse
+    // than early but still far better than the OS default.
+    let sock = socket2::SockRef::from(stream);
+    let _ = sock.set_recv_buffer_size(TCP_BUFFER_BYTES);
+    let _ = sock.set_send_buffer_size(TCP_BUFFER_BYTES);
     Ok(())
 }
 
@@ -116,8 +169,8 @@ pub fn configure_tcp_stream(stream: &TcpStream) -> std::io::Result<()> {
 /// Larger buffers let TCP-inside-the-tunnel open a bigger window and absorb
 /// bursts; failures are logged (via the caller) and never fatal.
 fn configure_tcp_socket(sock: &Socket) -> std::io::Result<()> {
-    let _ = sock.set_recv_buffer_size(UDP_BUFFER_BYTES);
-    let _ = sock.set_send_buffer_size(UDP_BUFFER_BYTES);
+    let _ = sock.set_recv_buffer_size(TCP_BUFFER_BYTES);
+    let _ = sock.set_send_buffer_size(TCP_BUFFER_BYTES);
     Ok(())
 }
 
