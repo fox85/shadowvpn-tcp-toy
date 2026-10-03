@@ -74,7 +74,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::{mpsc, Mutex, RwLock};
 use log::{debug, info, warn};
@@ -267,11 +267,22 @@ fn append_frame(out: &mut Vec<u8>, payload: &[u8]) -> bool {
 }
 
 /// Drive one connection's read half: parse frames and push them to `inbound`.
-async fn tcp_read_loop<R: AsyncRead + Unpin>(
+///
+/// Generic over what the consumer wants each frame tagged with: the server
+/// needs the peer address alongside the bytes (its hub merges many
+/// connections into one channel and must know where to reply), while the
+/// client has exactly one server and so wants the bytes alone. `tag` is
+/// called once per frame, so it is the only place the two differ.
+async fn tcp_read_loop<R, T, F>(
     reader: R,
-    inbound: mpsc::Sender<Vec<u8>>,
+    inbound: mpsc::Sender<T>,
+    tag: F,
     buf_len: usize,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    F: Fn(Vec<u8>) -> T,
+{
     let mut reader = FrameReader::new(reader);
     let mut frame = vec![0u8; buf_len];
     loop {
@@ -282,7 +293,7 @@ async fn tcp_read_loop<R: AsyncRead + Unpin>(
         if n == 0 {
             continue;
         }
-        if inbound.send(frame[..n].to_vec()).await.is_err() {
+        if inbound.send(tag(frame[..n].to_vec())).await.is_err() {
             return Ok(()); // consumer gone
         }
     }
@@ -374,7 +385,9 @@ impl TcpHub {
                         let hub3 = Arc::clone(&hub2);
                         let inbound_tx = tx.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = tcp_read_loop(reader, inbound_tx, buf_len).await {
+                            if let Err(e) =
+                                tcp_read_loop(reader, inbound_tx, move |p| (peer, p), buf_len).await
+                            {
                                 debug!("tcp connection from {peer} ended: {e}");
                             }
                             hub3.outbound.write().await.remove(&peer);
@@ -533,6 +546,7 @@ impl TcpClient {
         let reader_task = tokio::spawn(tcp_read_loop(
             reader,
             tx,
+            |p| p,
             MAX_TCP_FRAME + crate::protocol::TCP_LEN_PREFIX,
         ));
 
