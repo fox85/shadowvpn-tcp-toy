@@ -148,19 +148,31 @@ impl Learned {
 
     /// Forget `ip` if it still points at `last_peer`, or the mapping is dead.
     fn unlearn(&mut self, ip: IpAddr, last_peer: Option<SocketAddr>, now: Instant, ttl: Duration) {
-        let Some(entry) = self.clients.get(&ip) else {
-            return;
-        };
-        let live = now.saturating_duration_since(entry.last_seen) <= ttl;
-        // With several endpoints per client, only drop the mapping when the
-        // caller's endpoint is the *last* one left (or the mapping is dead) —
+        // With several endpoints per client, only drop the *mapping* when the
+        // caller's endpoint is the last one left (or the mapping is dead) —
         // otherwise a single subflow going away would evict a live client.
-        let last_one = entry.peers.len() <= 1;
-        let matches = last_peer.map_or(false, |p| entry.peers.contains(&p));
-        if !live || (matches && last_one) {
+        //
+        // The decision is computed inside a scope so the borrow of `clients`
+        // ends before the `remove` below, which needs `&mut self`.
+        let drop_mapping = {
+            let Some(entry) = self.clients.get_mut(&ip) else {
+                return;
+            };
+            let live = now.saturating_duration_since(entry.last_seen) <= ttl;
+            let last_one = entry.peers.len() <= 1;
+            let peer_matches = last_peer.is_some_and(|p| entry.peers.contains(&p));
+
+            if !live || (peer_matches && last_one) {
+                true // remove the whole mapping below
+            } else {
+                if peer_matches {
+                    entry.peers.retain(|p| Some(*p) != last_peer);
+                }
+                false
+            }
+        };
+        if drop_mapping {
             self.clients.remove(&ip);
-        } else if matches {
-            entry.peers.retain(|p| Some(*p) != last_peer);
         }
     }
 }
