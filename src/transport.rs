@@ -267,10 +267,14 @@ pub fn flow_hash(packet: &[u8]) -> u32 {
 }
 
 /// Look up subflow `idx`'s writer handle, flattening the nested `Option`.
-fn slot_of(
-    outbound: &tokio::sync::RwLockReadGuard<'_, Vec<Option<mpsc::Sender<Vec<u8>>>>>,
+///
+/// The returned borrow comes from the *guard's contents*, not from the guard's
+/// own lifetime parameter — `Deref` hands out `&'a T` for `&'a Guard`, so `'a`
+/// on the outer reference is what the result inherits.
+fn slot_of<'a>(
+    outbound: &'a tokio::sync::RwLockReadGuard<'_, Vec<Option<mpsc::Sender<Vec<u8>>>>>,
     idx: usize,
-) -> Option<&mpsc::Sender<Vec<u8>>> {
+) -> Option<&'a mpsc::Sender<Vec<u8>>> {
     outbound.get(idx).and_then(|s| s.as_ref())
 }
 
