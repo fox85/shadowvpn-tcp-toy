@@ -1,0 +1,993 @@
+//! The split-DNS proxy at the heart of policy routing.
+//!
+//! This is a tiny stand-in for the classic `dnsmasq` + ipset recipe. It listens
+//! for DNS queries from the local stub resolver and, depending on the
+//! [`Mode`], forwards each to the right upstream and decides whether
+//! the answer's addresses should be routed through the tunnel:
+//!
+//! * **gfwlist mode** — names matching the [`GfwList`] go to the *clean* upstream
+//!   (reached through the tunnel); their addresses are added to the route set.
+//!   Everything else goes to the *local* upstream and is left on the direct path.
+//! * **chinadns mode** — the clean (tunneled) query and the local query run
+//!   concurrently, but the resolver returns as soon as the *local* answer settles
+//!   a domestic (in-China, [`ChnRoute`]) result — so China names resolve at
+//!   local-DNS speed instead of waiting for the slow clean upstream. Only
+//!   foreign/poisoned names wait for the clean answer, whose addresses are then
+//!   routed through the tunnel. An optional [`GfwList`] acts as a force-tunnel
+//!   override: names on it always take the clean (tunneled) path regardless of
+//!   the race, covering domains the GFW poisons to an in-China-looking address.
+//!
+//! Answers are [cached](super::cache) by question (TTL-respecting), so repeat
+//! lookups skip the upstream round-trip entirely. Responses are otherwise relayed
+//! verbatim (the cache only rewrites the transaction id to match the new query).
+//!
+//! Adding addresses to the route set is abstracted behind [`IpSink`] so the
+//! routing logic can be unit-tested without root.
+
+use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use anyhow::{Context, Result};
+use log::{debug, warn};
+use tokio::net::UdpSocket;
+
+use super::cache;
+use super::chnroute::ChnRoute;
+use super::dns;
+use super::gfwlist::GfwList;
+use super::Mode;
+use crate::magic::{is_magic_suffix_name, PeerTable, MAGIC_TTL_SECS};
+
+/// Maximum DNS-over-UDP message we will buffer (generous EDNS0 headroom).
+const MAX_DNS_MSG: usize = 4096;
+
+/// A destination for addresses that should be routed through the tunnel.
+///
+/// The production implementation adds them to a kernel ipset; tests use an
+/// in-memory collector.
+pub trait IpSink: Send + Sync {
+    /// Add one IPv4 address to the tunnel-routed set. Implementations should be
+    /// idempotent and must not panic on error (a failure to add one address
+    /// must not take down the resolver).
+    fn add(&self, ip: Ipv4Addr);
+}
+
+/// What to do with a resolved name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// Leave it on the direct path.
+    Direct,
+    /// Route its addresses through the tunnel (and add them to the ipset).
+    Tunnel,
+}
+
+/// chinadns decision: domestic (direct) if the local resolver returned any
+/// in-China address, otherwise trust the clean upstream (tunnel).
+pub fn chinadns_decision(local_ips: &[Ipv4Addr], chnroute: &ChnRoute) -> Decision {
+    if local_ips.iter().any(|ip| chnroute.contains(*ip)) {
+        Decision::Direct
+    } else {
+        Decision::Tunnel
+    }
+}
+
+/// A decided answer: the raw response to relay, and the addresses (if any) that
+/// must be routed through the tunnel.
+struct Decided {
+    response: Vec<u8>,
+    tunnel_ips: Vec<Ipv4Addr>,
+}
+
+/// The resolver state shared across all in-flight queries.
+pub struct Resolver {
+    mode: Mode,
+    gfwlist: GfwList,
+    chnroute: ChnRoute,
+    local: SocketAddr,
+    remote: SocketAddr,
+    timeout: Duration,
+    sink: Arc<dyn IpSink>,
+    cache: Arc<cache::DnsCache>,
+    /// Source address to bind direct (local-upstream) queries to, and the source
+    /// for tunneled (remote-upstream) queries. Defaults to unspecified, letting
+    /// the OS choose. Production pins these to the physical and tun addresses
+    /// respectively, so a tun `/32` installed to attract host DNS does not
+    /// steal the resolver's own direct queries (and so tunneled queries still
+    /// enter the tun).
+    local_bind: IpAddr,
+    remote_bind: IpAddr,
+    /// Physical interface name to bind direct queries to (`SO_BINDTODEVICE` /
+    /// `IP_BOUND_IF`). `None` in tests and when the iface cannot be resolved.
+    direct_device: Option<String>,
+    /// Source ports of in-flight upstream DNS sockets. TUN packets from these
+    /// ports are the resolver's own tunneled queries and must not be intercepted
+    /// (that would recurse into [`Resolver::resolve`]).
+    inflight: Arc<Mutex<HashSet<u16>>>,
+    /// Magic DNS overlay. When set, peer names are answered locally before
+    /// any cache or upstream lookup.
+    magic: Option<MagicDns>,
+}
+
+/// Local Magic DNS state shared with the control-plane peer table.
+struct MagicDns {
+    peers: Arc<PeerTable>,
+    suffix: String,
+}
+
+impl Resolver {
+    /// Build a resolver. `gfwlist` is consulted in gfwlist mode and as an optional
+    /// force-tunnel override in chinadns mode; `chnroute` is only consulted in
+    /// chinadns mode. Pass empty defaults for whichever is unused.
+    /// `cache` is shared so it can be pre-loaded and persisted by the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        mode: Mode,
+        gfwlist: GfwList,
+        chnroute: ChnRoute,
+        local: SocketAddr,
+        remote: SocketAddr,
+        timeout: Duration,
+        sink: Arc<dyn IpSink>,
+        cache: Arc<cache::DnsCache>,
+    ) -> Self {
+        Self {
+            mode,
+            gfwlist,
+            chnroute,
+            local,
+            remote,
+            timeout,
+            sink,
+            cache,
+            local_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            remote_bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            direct_device: None,
+            inflight: Arc::new(Mutex::new(HashSet::new())),
+            magic: None,
+        }
+    }
+
+    /// Answer Magic DNS names from `peers` (suffix `suffix`) before any
+    /// upstream lookup.
+    pub fn with_magic(mut self, peers: Arc<PeerTable>, suffix: String) -> Self {
+        self.magic = Some(MagicDns { peers, suffix });
+        self
+    }
+
+    /// Pin the source addresses used for direct (`local`) and tunneled (`remote`)
+    /// upstream queries. Direct queries bind to the physical source so they do
+    /// not follow a tun host-route installed to attract DNS; tunneled queries
+    /// bind to the tun address so they still enter the tunnel.
+    pub fn with_bind_sources(mut self, local_bind: IpAddr, remote_bind: IpAddr) -> Self {
+        self.local_bind = local_bind;
+        self.remote_bind = remote_bind;
+        self
+    }
+
+    /// Bind direct (domestic) upstream sockets to this interface so a tun `/32`
+    /// for the same dest cannot steal them.
+    pub fn with_direct_device(mut self, device: String) -> Self {
+        self.direct_device = Some(device);
+        self
+    }
+
+    /// True when `port` is the source port of an in-flight upstream DNS socket.
+    ///
+    /// The TUN intercept path uses this to pass the resolver's own tunneled
+    /// queries through to encrypt/send instead of answering them locally.
+    pub fn owns_source_port(&self, port: u16) -> bool {
+        self.inflight.lock().unwrap().contains(&port)
+    }
+
+    /// Resolve one raw DNS query, returning the raw response to relay back, or
+    /// `None` if no usable answer could be obtained.
+    ///
+    /// Fresh answers are served from the cache; otherwise the per-mode logic runs
+    /// and its result is cached. Either way, any tunnel-bound addresses are
+    /// (re-)installed into the route set (the sink is idempotent).
+    pub async fn resolve(&self, query: &[u8]) -> Option<Vec<u8>> {
+        if let Some(resp) = self.answer_magic(query) {
+            return Some(resp);
+        }
+
+        if matches!(self.mode, Mode::Full) {
+            return self.forward_local(query).await;
+        }
+
+        if let Some((response, tunnel_ips)) = self.cache.get(query) {
+            self.tunnel(&tunnel_ips);
+            return Some(response);
+        }
+
+        let decided = match self.mode {
+            Mode::Full => return None,
+            Mode::GfwList => {
+                let name = dns::question_name(query);
+                self.decide_gfwlist(query, name.as_deref()).await?
+            }
+            Mode::ChinaDns => {
+                let name = dns::question_name(query);
+                self.decide_chinadns(query, name.as_deref()).await?
+            }
+        };
+
+        self.tunnel(&decided.tunnel_ips);
+        self.cache
+            .put(query, &decided.response, &decided.tunnel_ips);
+        Some(decided.response)
+    }
+
+    /// gfwlist mode: pick the upstream by name, tunnel the answer if matched.
+    async fn decide_gfwlist(&self, query: &[u8], name: Option<&str>) -> Option<Decided> {
+        let tunnel = name.map(|n| self.gfwlist.matches(n)).unwrap_or(false);
+        let upstream = if tunnel { self.remote } else { self.local };
+        let bind = if tunnel {
+            self.remote_bind
+        } else {
+            self.local_bind
+        };
+        let bind_dev = self.direct_dev_for(bind);
+        let response = match query_upstream(
+            upstream,
+            query,
+            self.timeout,
+            bind,
+            bind_dev,
+            &self.inflight,
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("gfwlist: upstream {upstream} failed for {name:?}: {e}");
+                return None;
+            }
+        };
+        let tunnel_ips = if tunnel {
+            dns::a_records(&response)
+        } else {
+            Vec::new()
+        };
+        Some(Decided {
+            response,
+            tunnel_ips,
+        })
+    }
+
+    /// chinadns mode: query both upstreams concurrently, but return as soon as the
+    /// *local* resolver settles a domestic (in-China) answer — so China names
+    /// resolve at local-DNS speed instead of waiting for the slow clean upstream.
+    /// Only foreign/poisoned names wait for the clean (tunneled) answer.
+    ///
+    /// A gfwlist, when configured, is an authoritative force-tunnel override: any
+    /// name on it always uses the clean (tunneled) upstream, bypassing the
+    /// local-vs-clean race. This covers domains the GFW poisons to an
+    /// in-China-looking address (or CDN-fronted blocked sites) that the race would
+    /// otherwise misclassify as domestic and leave on the direct path.
+    async fn decide_chinadns(&self, query: &[u8], name: Option<&str>) -> Option<Decided> {
+        // Force-tunnel override: gfwlist names skip the race and go clean-only.
+        if name.map(|n| self.gfwlist.matches(n)).unwrap_or(false) {
+            let response = match query_upstream(
+                self.remote,
+                query,
+                self.timeout,
+                self.remote_bind,
+                None,
+                &self.inflight,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!(
+                        "chinadns: forced-tunnel upstream {} failed for {name:?}: {e}",
+                        self.remote
+                    );
+                    return None;
+                }
+            };
+            let tunnel_ips = dns::a_records(&response);
+            return Some(Decided {
+                response,
+                tunnel_ips,
+            });
+        }
+
+        // Start the clean (tunneled) query in the background so it overlaps the
+        // local query, but don't block on it unless we actually need it.
+        let remote_query = query.to_vec();
+        let remote = self.remote;
+        let remote_bind = self.remote_bind;
+        let timeout = self.timeout;
+        let inflight = Arc::clone(&self.inflight);
+        let remote_task = tokio::spawn(async move {
+            query_upstream(remote, &remote_query, timeout, remote_bind, None, &inflight)
+                .await
+                .ok()
+        });
+
+        let local_res = query_upstream(
+            self.local,
+            query,
+            self.timeout,
+            self.local_bind,
+            self.direct_dev_for(self.local_bind),
+            &self.inflight,
+        )
+        .await
+        .ok();
+        let local_ips = local_res.as_deref().map(dns::a_records).unwrap_or_default();
+
+        // Domestic: trust the local answer and drop the in-flight clean query.
+        if local_res.is_some() && chinadns_decision(&local_ips, &self.chnroute) == Decision::Direct
+        {
+            remote_task.abort();
+            return local_res.map(|response| Decided {
+                response,
+                tunnel_ips: Vec::new(),
+            });
+        }
+
+        // Foreign / poisoned / no local answer: use the clean upstream's answer
+        // (falling back to local if it failed) and route it through the tunnel.
+        let remote_res = remote_task.await.ok().flatten();
+        let response = remote_res.or(local_res)?;
+        let tunnel_ips = dns::a_records(&response);
+        Some(Decided {
+            response,
+            tunnel_ips,
+        })
+    }
+
+    /// (Re-)install every tunnel-bound address into the route set.
+    fn tunnel(&self, ips: &[Ipv4Addr]) {
+        for ip in ips {
+            self.sink.add(*ip);
+        }
+    }
+
+    /// Answer a Magic DNS name from the local peer table, or NXDOMAIN for an
+    /// unknown name in the Magic suffix zone. Peer IPs are already on-link
+    /// on the TUN, so they are not added to the tunnel route sink.
+    fn answer_magic(&self, query: &[u8]) -> Option<Vec<u8>> {
+        let magic = self.magic.as_ref()?;
+        let (name, qtype, qclass) = dns::question(query)?;
+        if qclass != dns::CLASS_IN {
+            return None;
+        }
+        if let Some(addrs) = magic.peers.lookup(&name) {
+            let ips = match qtype {
+                dns::TYPE_A => vec![std::net::IpAddr::V4(addrs.ip4)],
+                dns::TYPE_AAAA => addrs.ip6.map(std::net::IpAddr::V6).into_iter().collect(),
+                _ => Vec::new(),
+            };
+            return dns::build_response(query, &ips, MAGIC_TTL_SECS);
+        }
+        if is_magic_suffix_name(&name, &magic.suffix) {
+            return dns::build_nxdomain(query);
+        }
+        None
+    }
+
+    /// Direct-device bind applies only to sockets using the local (physical)
+    /// source address — never to tunneled upstreams, which must enter the tun.
+    fn direct_dev_for(&self, bind_src: IpAddr) -> Option<&str> {
+        if bind_src == self.local_bind {
+            self.direct_device.as_deref()
+        } else {
+            None
+        }
+    }
+
+    /// Full-mode forwarder: send everything that isn't Magic DNS to `dns_local`.
+    async fn forward_local(&self, query: &[u8]) -> Option<Vec<u8>> {
+        match query_upstream(
+            self.local,
+            query,
+            self.timeout,
+            self.local_bind,
+            self.direct_dev_for(self.local_bind),
+            &self.inflight,
+        )
+        .await
+        {
+            Ok(r) => Some(r),
+            Err(e) => {
+                debug!("magic-dns: forward to {} failed: {e}", self.local);
+                None
+            }
+        }
+    }
+}
+
+/// Drops an in-flight source port from `inflight` when the upstream socket ends.
+struct PortGuard {
+    inflight: Arc<Mutex<HashSet<u16>>>,
+    port: u16,
+}
+
+impl Drop for PortGuard {
+    fn drop(&mut self) {
+        self.inflight.lock().unwrap().remove(&self.port);
+    }
+}
+
+/// Send a query to one upstream over a fresh ephemeral UDP socket and return the
+/// raw response, bounded by `timeout`.
+///
+/// `bind_dev`, when set, pins the socket to that interface so a tun host-route
+/// for `server` cannot steal the packet. The socket's ephemeral source port is
+/// recorded in `inflight` for the lifetime of the query so TUN intercept can
+/// pass matching packets through.
+async fn query_upstream(
+    server: SocketAddr,
+    query: &[u8],
+    timeout: Duration,
+    bind_src: IpAddr,
+    bind_dev: Option<&str>,
+    inflight: &Arc<Mutex<HashSet<u16>>>,
+) -> Result<Vec<u8>> {
+    let sock = bind_upstream_socket(bind_src, bind_dev)
+        .await
+        .context("bind upstream DNS socket")?;
+    let _guard = match sock.local_addr() {
+        Ok(addr) if addr.port() != 0 => {
+            inflight.lock().unwrap().insert(addr.port());
+            Some(PortGuard {
+                inflight: Arc::clone(inflight),
+                port: addr.port(),
+            })
+        }
+        _ => None,
+    };
+    sock.connect(server)
+        .await
+        .with_context(|| format!("connect to DNS upstream {server}"))?;
+    sock.send(query).await.context("send DNS query")?;
+
+    let mut buf = vec![0u8; MAX_DNS_MSG];
+    let n = tokio::time::timeout(timeout, sock.recv(&mut buf))
+        .await
+        .with_context(|| format!("DNS upstream {server} timed out"))?
+        .context("recv DNS response")?;
+    buf.truncate(n);
+    Ok(buf)
+}
+
+/// Bind an ephemeral UDP socket at `bind_src`, optionally pinned to `bind_dev`.
+async fn bind_upstream_socket(
+    bind_src: IpAddr,
+    bind_dev: Option<&str>,
+) -> std::io::Result<UdpSocket> {
+    let addr: SocketAddr = (bind_src, 0).into();
+    let sock = UdpSocket::bind(addr).await?;
+    if let Some(dev) = bind_dev {
+        if let Err(e) = bind_to_device(&sock, dev) {
+            debug!("DNS upstream: bind to device {dev} failed: {e}");
+        }
+    }
+    Ok(sock)
+}
+
+/// Force outgoing packets onto `dev` so a tun `/32` for the dest cannot steal them.
+fn bind_to_device(sock: &UdpSocket, dev: &str) -> std::io::Result<()> {
+    bind_to_device_imp(sock, dev)
+}
+
+#[cfg(target_os = "linux")]
+fn bind_to_device_imp(sock: &UdpSocket, dev: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let cname = std::ffi::CString::new(dev).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "interface name has a NUL")
+    })?;
+    let bytes = cname.as_bytes_with_nul();
+    // SAFETY: `sock` is a live UDP socket; SO_BINDTODEVICE reads `bytes` for
+    // `bytes.len()` and does not retain the pointer.
+    let ret = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            bytes.as_ptr().cast(),
+            bytes.len() as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn bind_to_device_imp(sock: &UdpSocket, dev: &str) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let cname = std::ffi::CString::new(dev).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "interface name has a NUL")
+    })?;
+    // SAFETY: `cname` is a valid C string for the duration of the call.
+    let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+    if idx == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: `sock` is a live UDP socket; IP_BOUND_IF reads a u32 ifindex.
+    let ret = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IP,
+            libc::IP_BOUND_IF,
+            (&idx as *const libc::c_uint).cast(),
+            std::mem::size_of_val(&idx) as libc::socklen_t,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios")))]
+fn bind_to_device_imp(_sock: &UdpSocket, _dev: &str) -> std::io::Result<()> {
+    Ok(())
+}
+
+/// Clear the Windows `SIO_UDP_CONNRESET` behavior on a UDP socket.
+///
+/// By default Windows reports a previously-sent datagram's ICMP "port
+/// unreachable" as a `WSAECONNRESET` error on the socket's next receive. For a
+/// DNS server socket that talks to many short-lived clients this is spurious and
+/// would otherwise kill the receive loop. Best-effort: failure is non-fatal
+/// because the receive loop also tolerates the error.
+#[cfg(windows)]
+fn disable_udp_conn_reset(sock: &UdpSocket) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::WSAIoctl;
+
+    // SIO_UDP_CONNRESET (0x9800000C) takes a 4-byte BOOL: FALSE disables it.
+    const SIO_UDP_CONNRESET: u32 = 0x9800_000C;
+    let disable: u32 = 0;
+    let mut returned: u32 = 0;
+
+    // SAFETY: `sock` is a valid bound UDP socket for the duration of the call;
+    // the control code reads a 4-byte input and writes no output buffer.
+    let ret = unsafe {
+        WSAIoctl(
+            sock.as_raw_socket() as _,
+            SIO_UDP_CONNRESET,
+            &disable as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if ret != 0 {
+        debug!("WSAIoctl(SIO_UDP_CONNRESET) failed; relying on recv-loop fallback");
+    }
+}
+
+/// Run the proxy: receive queries on `listener` and answer each with `resolver`.
+///
+/// Each query is handled in its own task so a slow upstream never blocks others.
+/// Returns only on a fatal error reading the listening socket.
+pub async fn serve(listener: UdpSocket, resolver: Arc<Resolver>) -> Result<()> {
+    let listener = Arc::new(listener);
+    // On Windows a UDP socket otherwise surfaces a prior ICMP port-unreachable as
+    // a fatal connection-reset on the *next* recv; suppress that for the listener.
+    #[cfg(windows)]
+    disable_udp_conn_reset(&listener);
+    let mut buf = vec![0u8; MAX_DNS_MSG];
+    loop {
+        let (n, client) = match listener.recv_from(&mut buf).await {
+            Ok(v) => v,
+            // Defensive fallback in case a connection-reset slips through (see
+            // `disable_udp_conn_reset`): it is spurious for a UDP listener, so
+            // log and keep serving rather than tearing the proxy down.
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {
+                debug!("DNS proxy: ignoring spurious connection-reset on recv");
+                continue;
+            }
+            Err(e) => return Err(e).context("DNS proxy recv_from failed"),
+        };
+        let query = buf[..n].to_vec();
+        let resolver = Arc::clone(&resolver);
+        let listener = Arc::clone(&listener);
+        tokio::spawn(async move {
+            match resolver.resolve(&query).await {
+                Some(resp) => {
+                    if let Err(e) = listener.send_to(&resp, client).await {
+                        warn!("DNS proxy failed to reply to {client}: {e}");
+                    }
+                }
+                None => debug!("DNS proxy: no answer for query from {client}"),
+            }
+        });
+    }
+}
+
+/// Resolve `domains` through `resolver` to pre-fill the cache (and pre-install
+/// routes for tunneled ones) so the first real lookup of a common domain is hot.
+///
+/// Runs in small concurrent batches and ignores individual failures; intended to
+/// be spawned in the background at startup.
+pub async fn prewarm(resolver: Arc<Resolver>, domains: Vec<String>) {
+    let total = domains.len();
+    for batch in domains.chunks(8) {
+        let mut handles = Vec::with_capacity(batch.len());
+        for (i, domain) in batch.iter().enumerate() {
+            let resolver = Arc::clone(&resolver);
+            let query = dns::build_query(i as u16 + 1, domain);
+            handles.push(tokio::spawn(async move { resolver.resolve(&query).await }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+    }
+    debug!("pre-warmed {total} domains into the DNS cache");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// In-memory [`IpSink`] for assertions.
+    #[derive(Default)]
+    struct VecSink(Mutex<Vec<Ipv4Addr>>);
+    impl IpSink for VecSink {
+        fn add(&self, ip: Ipv4Addr) {
+            self.0.lock().unwrap().push(ip);
+        }
+    }
+    impl VecSink {
+        fn ips(&self) -> Vec<Ipv4Addr> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    fn query(name: &str) -> Vec<u8> {
+        let mut m = vec![0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.') {
+            m.push(label.len() as u8);
+            m.extend_from_slice(label.as_bytes());
+        }
+        m.push(0);
+        m.extend_from_slice(&[0, 1, 0, 1]); // QTYPE=A, QCLASS=IN
+        m
+    }
+
+    /// Build a response to `query` with the given A records.
+    fn response(query: &[u8], ips: &[Ipv4Addr]) -> Vec<u8> {
+        let mut m = query.to_vec();
+        m[2] = 0x81;
+        m[3] = 0x80;
+        m[6] = (ips.len() >> 8) as u8;
+        m[7] = ips.len() as u8;
+        for ip in ips {
+            m.extend_from_slice(&[0xC0, 0x0C]); // pointer to question name
+            m.extend_from_slice(&[0, 1, 0, 1]); // TYPE=A CLASS=IN
+            m.extend_from_slice(&300u32.to_be_bytes());
+            m.extend_from_slice(&4u16.to_be_bytes());
+            m.extend_from_slice(&ip.octets());
+        }
+        m
+    }
+
+    /// Spawn a mock upstream that always answers with `ips`. Returns its addr.
+    async fn mock_upstream(ips: Vec<Ipv4Addr>) -> SocketAddr {
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_DNS_MSG];
+            loop {
+                let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+                let resp = response(&buf[..n], &ips);
+                sock.send_to(&resp, from).await.unwrap();
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn gfwlist_tunnels_only_matched_domains() {
+        let local = mock_upstream(vec![Ipv4Addr::new(10, 0, 0, 1)]).await;
+        let remote = mock_upstream(vec![Ipv4Addr::new(93, 184, 216, 34)]).await;
+        let sink = Arc::new(VecSink::default());
+        let r = Resolver::new(
+            Mode::GfwList,
+            GfwList::from_lines(["blocked.com"]),
+            ChnRoute::default(),
+            local,
+            remote,
+            Duration::from_secs(2),
+            sink.clone(),
+            Arc::new(cache::DnsCache::new()),
+        );
+
+        // Matched: goes to remote, address tunneled.
+        let resp = r.resolve(&query("www.blocked.com")).await.unwrap();
+        assert_eq!(dns::a_records(&resp), vec![Ipv4Addr::new(93, 184, 216, 34)]);
+        // Not matched: goes to local, nothing tunneled.
+        let resp = r.resolve(&query("safe.cn")).await.unwrap();
+        assert_eq!(dns::a_records(&resp), vec![Ipv4Addr::new(10, 0, 0, 1)]);
+
+        assert_eq!(sink.ips(), vec![Ipv4Addr::new(93, 184, 216, 34)]);
+    }
+
+    #[tokio::test]
+    async fn chinadns_routes_by_china_membership() {
+        // Local returns a China IP for the domestic name and a (poisoned)
+        // foreign IP for the blocked name; remote returns the real foreign IP.
+        let china_ip = Ipv4Addr::new(114, 114, 114, 114);
+        let poison_ip = Ipv4Addr::new(8, 7, 6, 5);
+        let real_ip = Ipv4Addr::new(93, 184, 216, 34);
+        let chnroute = ChnRoute::from_lines(["114.114.114.0/24"]);
+
+        let sink = Arc::new(VecSink::default());
+
+        // Domestic: local says China -> use local, no tunnel.
+        let r_dom = Resolver::new(
+            Mode::ChinaDns,
+            GfwList::default(),
+            chnroute.clone(),
+            mock_upstream(vec![china_ip]).await,
+            mock_upstream(vec![real_ip]).await,
+            Duration::from_secs(2),
+            sink.clone(),
+            Arc::new(cache::DnsCache::new()),
+        );
+        let resp = r_dom.resolve(&query("baidu.cn")).await.unwrap();
+        assert_eq!(dns::a_records(&resp), vec![china_ip]);
+        assert!(sink.ips().is_empty());
+
+        // Blocked: local says foreign(poison) -> trust remote, tunnel it.
+        let r_blk = Resolver::new(
+            Mode::ChinaDns,
+            GfwList::default(),
+            chnroute,
+            mock_upstream(vec![poison_ip]).await,
+            mock_upstream(vec![real_ip]).await,
+            Duration::from_secs(2),
+            sink.clone(),
+            Arc::new(cache::DnsCache::new()),
+        );
+        let resp = r_blk.resolve(&query("blocked.com")).await.unwrap();
+        assert_eq!(dns::a_records(&resp), vec![real_ip]);
+        assert_eq!(sink.ips(), vec![real_ip]);
+    }
+
+    #[tokio::test]
+    async fn chinadns_gfwlist_forces_tunnel_over_china_answer() {
+        // The local resolver returns a China IP for the blocked name (as the GFW
+        // poison or a CDN front would) — the race alone would keep it direct.
+        // The gfwlist override must force it onto the clean (tunneled) upstream.
+        let china_ip = Ipv4Addr::new(114, 114, 114, 114);
+        let real_ip = Ipv4Addr::new(93, 184, 216, 34);
+        let chnroute = ChnRoute::from_lines(["114.114.114.0/24"]);
+        let sink = Arc::new(VecSink::default());
+
+        let r = Resolver::new(
+            Mode::ChinaDns,
+            GfwList::from_lines(["blocked.com"]),
+            chnroute,
+            mock_upstream(vec![china_ip]).await, // local: looks domestic
+            mock_upstream(vec![real_ip]).await,  // remote (clean, tunneled)
+            Duration::from_secs(2),
+            sink.clone(),
+            Arc::new(cache::DnsCache::new()),
+        );
+
+        // On the gfwlist: forced to remote and tunneled despite the China answer.
+        let resp = r.resolve(&query("www.blocked.com")).await.unwrap();
+        assert_eq!(dns::a_records(&resp), vec![real_ip]);
+        assert_eq!(sink.ips(), vec![real_ip]);
+
+        // Not on the gfwlist: ordinary chinadns race -> trust the China answer.
+        let resp = r.resolve(&query("safe.cn")).await.unwrap();
+        assert_eq!(dns::a_records(&resp), vec![china_ip]);
+        assert_eq!(sink.ips(), vec![real_ip]); // unchanged: nothing new tunneled
+    }
+
+    /// A mock upstream that answers with a different IP (10.0.0.N) on each query,
+    /// so a second *cached* lookup is distinguishable from a fresh upstream call.
+    async fn mock_counting() -> SocketAddr {
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_DNS_MSG];
+            let mut n: u8 = 0;
+            loop {
+                let (len, from) = sock.recv_from(&mut buf).await.unwrap();
+                n += 1;
+                let resp = response(&buf[..len], &[Ipv4Addr::new(10, 0, 0, n)]);
+                sock.send_to(&resp, from).await.unwrap();
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn second_lookup_is_served_from_cache() {
+        let remote = mock_counting().await;
+        let sink = Arc::new(VecSink::default());
+        let r = Resolver::new(
+            Mode::GfwList,
+            GfwList::from_lines(["blocked.com"]),
+            ChnRoute::default(),
+            mock_upstream(vec![Ipv4Addr::new(10, 0, 0, 1)]).await,
+            remote,
+            Duration::from_secs(2),
+            sink.clone(),
+            Arc::new(cache::DnsCache::new()),
+        );
+        // First lookup hits the (counting) upstream -> 10.0.0.1.
+        let first = r.resolve(&query("www.blocked.com")).await.unwrap();
+        assert_eq!(dns::a_records(&first), vec![Ipv4Addr::new(10, 0, 0, 1)]);
+        // Second lookup must come from cache: still 10.0.0.1, not 10.0.0.2.
+        let second = r.resolve(&query("www.blocked.com")).await.unwrap();
+        assert_eq!(dns::a_records(&second), vec![Ipv4Addr::new(10, 0, 0, 1)]);
+    }
+
+    #[tokio::test]
+    async fn chinadns_does_not_wait_for_remote_on_china_domain() {
+        let china = Ipv4Addr::new(114, 114, 114, 114);
+        let local = mock_upstream(vec![china]).await;
+        // Unreachable (RFC 5737 TEST-NET-1): querying it would hang until timeout.
+        let dead: SocketAddr = "192.0.2.1:53".parse().unwrap();
+        let sink = Arc::new(VecSink::default());
+        let r = Resolver::new(
+            Mode::ChinaDns,
+            GfwList::default(),
+            ChnRoute::from_lines(["114.114.114.0/24"]),
+            local,
+            dead,
+            Duration::from_secs(30), // long: proves we don't block on `dead`
+            sink.clone(),
+            Arc::new(cache::DnsCache::new()),
+        );
+        // If the resolver wrongly waited for the dead remote it would take ~30s;
+        // a 2s bound proves the early return on a domestic answer.
+        let resp = tokio::time::timeout(Duration::from_secs(2), r.resolve(&query("baidu.cn")))
+            .await
+            .expect("resolved without waiting for the remote")
+            .expect("got an answer");
+        assert_eq!(dns::a_records(&resp), vec![china]);
+        assert!(sink.ips().is_empty());
+    }
+
+    #[test]
+    fn decision_is_china_aware() {
+        let chn = ChnRoute::from_lines(["1.2.3.0/24"]);
+        assert_eq!(
+            chinadns_decision(&[Ipv4Addr::new(1, 2, 3, 4)], &chn),
+            Decision::Direct
+        );
+        assert_eq!(
+            chinadns_decision(&[Ipv4Addr::new(8, 8, 8, 8)], &chn),
+            Decision::Tunnel
+        );
+        assert_eq!(chinadns_decision(&[], &chn), Decision::Tunnel);
+    }
+
+    #[tokio::test]
+    async fn magic_dns_answers_peers_and_nxdomains_suffix() {
+        let local = mock_upstream(vec![Ipv4Addr::new(1, 2, 3, 4)]).await;
+        let remote = mock_upstream(vec![Ipv4Addr::new(8, 8, 8, 8)]).await;
+        let table = Arc::new(PeerTable::new());
+        table.replace(
+            &[crate::mesh::PeerEntry {
+                name: "pi".into(),
+                ip4: Ipv4Addr::new(10, 9, 0, 7),
+                ip6: None,
+            }],
+            "svpn",
+        );
+        let sink = Arc::new(VecSink::default());
+        let r = Resolver::new(
+            Mode::GfwList,
+            GfwList::from_lines(["blocked.com"]),
+            ChnRoute::default(),
+            local,
+            remote,
+            Duration::from_secs(2),
+            sink.clone(),
+            Arc::new(cache::DnsCache::new()),
+        )
+        .with_magic(table, "svpn".into());
+
+        let resp = r.resolve(&query("pi.svpn")).await.unwrap();
+        assert_eq!(dns::a_records(&resp), vec![Ipv4Addr::new(10, 9, 0, 7)]);
+        // Peer IPs are on-link: do not install a host route.
+        assert!(sink.ips().is_empty());
+
+        let nx = r.resolve(&query("nope.svpn")).await.unwrap();
+        assert_eq!(nx[3] & 0x0f, 3);
+
+        // Non-magic names still go upstream.
+        let other = r.resolve(&query("safe.cn")).await.unwrap();
+        assert_eq!(dns::a_records(&other), vec![Ipv4Addr::new(1, 2, 3, 4)]);
+    }
+
+    #[tokio::test]
+    async fn full_mode_forwards_non_magic() {
+        let local = mock_upstream(vec![Ipv4Addr::new(9, 9, 9, 9)]).await;
+        let remote = mock_upstream(vec![Ipv4Addr::new(8, 8, 8, 8)]).await;
+        let table = Arc::new(PeerTable::new());
+        table.replace(
+            &[crate::mesh::PeerEntry {
+                name: "laptop".into(),
+                ip4: Ipv4Addr::new(10, 9, 0, 5),
+                ip6: None,
+            }],
+            "svpn",
+        );
+        let r = Resolver::new(
+            Mode::Full,
+            GfwList::default(),
+            ChnRoute::default(),
+            local,
+            remote,
+            Duration::from_secs(2),
+            Arc::new(VecSink::default()),
+            Arc::new(cache::DnsCache::new()),
+        )
+        .with_magic(table, "svpn".into());
+
+        let hit = r.resolve(&query("laptop")).await.unwrap();
+        assert_eq!(dns::a_records(&hit), vec![Ipv4Addr::new(10, 9, 0, 5)]);
+        let fwd = r.resolve(&query("example.com")).await.unwrap();
+        assert_eq!(dns::a_records(&fwd), vec![Ipv4Addr::new(9, 9, 9, 9)]);
+    }
+
+    #[tokio::test]
+    async fn tracks_in_flight_upstream_source_port() {
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; MAX_DNS_MSG];
+            let (n, from) = sock.recv_from(&mut buf).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let resp = response(&buf[..n], &[Ipv4Addr::new(9, 9, 9, 9)]);
+            let _ = sock.send_to(&resp, from).await;
+        });
+        let r = Arc::new(Resolver::new(
+            Mode::GfwList,
+            GfwList::from_lines(["blocked.com"]),
+            ChnRoute::default(),
+            addr,
+            addr,
+            Duration::from_secs(2),
+            Arc::new(VecSink::default()),
+            Arc::new(cache::DnsCache::new()),
+        ));
+        let q = query("www.blocked.com");
+        let r2 = Arc::clone(&r);
+        let h = tokio::spawn(async move { r2.resolve(&q).await });
+        let start = std::time::Instant::now();
+        loop {
+            if !r.inflight.lock().unwrap().is_empty() {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(1) {
+                panic!("upstream source port was never recorded");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let ports: Vec<u16> = r.inflight.lock().unwrap().iter().copied().collect();
+        assert!(!ports.is_empty());
+        for p in &ports {
+            assert!(r.owns_source_port(*p));
+        }
+        assert!(!r.owns_source_port(1), "unrelated port is not owned");
+        h.await.unwrap().expect("resolved");
+        assert!(
+            r.inflight.lock().unwrap().is_empty(),
+            "port released after query"
+        );
+    }
+}

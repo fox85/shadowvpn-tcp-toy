@@ -1,0 +1,752 @@
+//! User-mode policy routing: program per-destination routes into the tun device.
+//!
+//! This replaces the Linux-only ipset + nft + fwmark machinery with a small,
+//! cross-platform router. As the split-DNS [`proxy`](super::proxy) decides a name
+//! should be tunneled, it hands each resolved address to [`TunRouter`], which
+//! installs a host route (`<ip>/32`) whose output device is the tun interface.
+//! The kernel then sends matching traffic into the tunnel — and, because the
+//! route's output device is the tun, picks the tun's address as the source, so
+//! the server's masquerade matches with no client-side NAT.
+//!
+//! Direct (non-tunneled) traffic is never touched: it stays on the normal kernel
+//! path, so no user-mode NAT or packet capture is needed. Only the routing table
+//! is modified, and only for addresses we explicitly tunnel.
+//!
+//! Routes are programmed with the OS's native routing interface — `rtnetlink`
+//! on Linux, `PF_ROUTE` on macOS/BSD, and the IP Helper API
+//! (`CreateIpForwardEntry2`) on Windows — so there is no dependency on `ip`,
+//! `ipset`, `iptables`, or `route`/`netsh`. Every address added is tracked and
+//! removed again when the [`RouteGuard`] is dropped.
+
+use std::collections::HashSet;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Mutex;
+
+use log::{debug, warn};
+
+use super::proxy::IpSink;
+
+/// Add (or delete) a route for `dst/prefix` whose output device is the tun
+/// interface `ifindex`. The building block shared by the split-DNS host routes
+/// below (always `/32`) and the mesh subnet routes ([`crate::mesh`]), which
+/// install arbitrary IPv4/IPv6 prefixes.
+///
+/// `tun_ip` is used as the route's preferred source where the platform wants
+/// one (Linux, IPv4 only); other platforms derive the source from the
+/// interface themselves.
+pub fn modify_route(
+    ifindex: u32,
+    tun_ip: Ipv4Addr,
+    dst: IpAddr,
+    prefix: u8,
+    add: bool,
+) -> io::Result<()> {
+    imp::modify_route(ifindex, tun_ip, dst, prefix, add)
+}
+
+/// Resolve an interface name to its kernel interface index.
+pub fn interface_index(name: &str) -> io::Result<u32> {
+    imp::interface_index(name)
+}
+
+/// Adds and removes `<ip>/32` routes pointing at the tun device.
+pub struct TunRouter {
+    /// Interface index of the tun device.
+    ifindex: u32,
+    /// The tun's local address, used as the route's preferred source.
+    tun_ip: Ipv4Addr,
+    /// Addresses that must never be routed into the tun — above all the VPN
+    /// server itself: routing the server's address into the tun would feed the
+    /// client's own encrypted datagrams back into the tunnel, an amplification
+    /// loop that floods the UDP socket until sends fail with ENOBUFS.
+    excluded: HashSet<Ipv4Addr>,
+    /// Every address we have installed a route for (for cleanup + dedup).
+    added: Mutex<HashSet<Ipv4Addr>>,
+}
+
+impl TunRouter {
+    /// Resolve the tun interface index and build a router for it.
+    pub fn new(tun_name: &str, tun_ip: Ipv4Addr) -> io::Result<Self> {
+        let ifindex = imp::interface_index(tun_name)?;
+        Ok(Self {
+            ifindex,
+            tun_ip,
+            excluded: HashSet::new(),
+            added: Mutex::new(HashSet::new()),
+        })
+    }
+
+    /// Never install a route for `ip` (e.g. the VPN server's own address).
+    pub fn exclude(mut self, ip: Ipv4Addr) -> Self {
+        self.excluded.insert(ip);
+        self
+    }
+
+    /// Install a route for `ip` if we have not already, recording it for cleanup.
+    pub fn add_route(&self, ip: Ipv4Addr) -> io::Result<()> {
+        if self.excluded.contains(&ip) {
+            debug!("not routing excluded address {ip} into the tun");
+            return Ok(());
+        }
+        {
+            let mut set = self.added.lock().unwrap();
+            if !set.insert(ip) {
+                return Ok(()); // already routed
+            }
+        }
+        imp::modify_route(self.ifindex, self.tun_ip, IpAddr::V4(ip), 32, true)
+    }
+
+    /// Remove every route we installed. Best-effort: logs failures, continues.
+    pub fn delete_all(&self) {
+        let ips: Vec<Ipv4Addr> = {
+            let mut set = self.added.lock().unwrap();
+            set.drain().collect()
+        };
+        for ip in ips {
+            if let Err(e) = imp::modify_route(self.ifindex, self.tun_ip, IpAddr::V4(ip), 32, false)
+            {
+                debug!("failed to delete route {ip}/32: {e}");
+            }
+        }
+    }
+}
+
+impl IpSink for TunRouter {
+    fn add(&self, ip: Ipv4Addr) {
+        if let Err(e) = self.add_route(ip) {
+            warn!("failed to add tunnel route {ip}/32: {e}");
+        }
+    }
+}
+
+/// Drop guard that removes all installed routes when the client exits.
+///
+/// Held separately from the [`IpSink`] handed to the proxy so that teardown runs
+/// as soon as the client's run loop returns, even though the (possibly detached)
+/// proxy task may still hold a reference to the same [`TunRouter`].
+pub struct RouteGuard {
+    router: std::sync::Arc<TunRouter>,
+}
+
+impl RouteGuard {
+    /// Wrap a router so its routes are cleaned up on drop.
+    pub fn new(router: std::sync::Arc<TunRouter>) -> Self {
+        Self { router }
+    }
+}
+
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        self.router.delete_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A router that skips interface resolution; only valid for exercising the
+    /// pre-syscall bookkeeping (exclusion, dedup) — `add_route` on a
+    /// non-excluded address would hit the real routing stack.
+    fn test_router() -> TunRouter {
+        TunRouter {
+            ifindex: 0,
+            tun_ip: Ipv4Addr::new(10, 9, 0, 2),
+            excluded: HashSet::new(),
+            added: Mutex::new(HashSet::new()),
+        }
+    }
+
+    #[test]
+    fn excluded_address_is_never_installed() {
+        let server = Ipv4Addr::new(157, 245, 227, 200);
+        let router = test_router().exclude(server);
+        // Every route source (live lookups, prewarm, cache seeding, the clean
+        // upstream pin) funnels through add_route, so this one check is the
+        // whole guarantee: the server's address must be dropped before any
+        // platform syscall, and must not be recorded for cleanup.
+        router
+            .add_route(server)
+            .expect("exclusion is a silent no-op");
+        assert!(router.added.lock().unwrap().is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Linux: rtnetlink over a raw AF_NETLINK socket.
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "linux")]
+mod imp {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    /// Resolve an interface name to its kernel index.
+    pub fn interface_index(name: &str) -> io::Result<u32> {
+        let cname = std::ffi::CString::new(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tun name has a NUL byte"))?;
+        // SAFETY: `cname` is a valid NUL-terminated C string for the call.
+        let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+        if idx == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(idx)
+        }
+    }
+
+    // rtnetlink message-type and flag constants (from <linux/netlink.h> and
+    // <linux/rtnetlink.h>); taken via libc where available.
+    const NLMSG_ERROR: u16 = 2;
+
+    /// Add (or delete) a `dst/prefix` route via the tun interface.
+    pub fn modify_route(
+        ifindex: u32,
+        tun_ip: Ipv4Addr,
+        dst: IpAddr,
+        prefix: u8,
+        add: bool,
+    ) -> io::Result<()> {
+        let msg = build_request(1, add, ifindex, tun_ip, dst, prefix);
+
+        // SAFETY: a straightforward socket()/send()/recv() sequence; all buffers
+        // and the destination sockaddr are valid for the duration of each call.
+        unsafe {
+            let fd = libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::NETLINK_ROUTE,
+            );
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let fd = OwnedFd::from_raw_fd(fd);
+
+            let mut sa: libc::sockaddr_nl = std::mem::zeroed();
+            sa.nl_family = libc::AF_NETLINK as u16;
+            let sent = libc::sendto(
+                fd.as_raw_fd(),
+                msg.as_ptr() as *const libc::c_void,
+                msg.len(),
+                0,
+                &sa as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+            );
+            if sent < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            let mut buf = [0u8; 4096];
+            let n = libc::recv(
+                fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+                0,
+            );
+            if n < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            parse_ack(&buf[..n as usize])
+        }
+    }
+
+    /// Parse a netlink ACK: an `NLMSG_ERROR` with `error == 0` means success.
+    fn parse_ack(buf: &[u8]) -> io::Result<()> {
+        // nlmsghdr is 16 bytes; nlmsgerr starts with an i32 error code.
+        if buf.len() < 20 {
+            return Ok(()); // no error payload -> treat as success
+        }
+        let nlmsg_type = u16::from_ne_bytes([buf[4], buf[5]]);
+        if nlmsg_type != NLMSG_ERROR {
+            return Ok(());
+        }
+        let err = i32::from_ne_bytes([buf[16], buf[17], buf[18], buf[19]]);
+        if err == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(-err))
+        }
+    }
+
+    /// Serialize an `RTM_NEWROUTE`/`RTM_DELROUTE` request for a `dst/prefix`
+    /// route.
+    fn build_request(
+        seq: u32,
+        add: bool,
+        ifindex: u32,
+        tun_ip: Ipv4Addr,
+        dst: IpAddr,
+        prefix: u8,
+    ) -> Vec<u8> {
+        const NLM_F_REQUEST: u16 = 0x01;
+        const NLM_F_ACK: u16 = 0x04;
+        const NLM_F_CREATE: u16 = 0x400;
+        const NLM_F_REPLACE: u16 = 0x100;
+        const RTM_NEWROUTE: u16 = 24;
+        const RTM_DELROUTE: u16 = 25;
+        const RT_TABLE_MAIN: u8 = 254;
+        const RTPROT_STATIC: u8 = 4;
+        const RT_SCOPE_LINK: u8 = 253;
+        const RT_SCOPE_UNIVERSE: u8 = 0;
+        // Deletes must use NOWHERE (the match-any wildcard, what iproute2
+        // sends): the kernel only deletes an IPv4 route whose scope equals
+        // the request's, and 0 (UNIVERSE) never matches the LINK-scoped
+        // routes installed here.
+        const RT_SCOPE_NOWHERE: u8 = 255;
+        const RTN_UNICAST: u8 = 1;
+        const RTA_DST: u16 = 1;
+        const RTA_OIF: u16 = 4;
+        const RTA_PREFSRC: u16 = 7;
+
+        let mut attrs = Vec::new();
+        match dst {
+            IpAddr::V4(v4) => push_attr(&mut attrs, RTA_DST, &v4.octets()),
+            IpAddr::V6(v6) => push_attr(&mut attrs, RTA_DST, &v6.octets()),
+        }
+        push_attr(&mut attrs, RTA_OIF, &ifindex.to_ne_bytes());
+        // Pin the source only for IPv4 (the tun's v4 address); for IPv6 the
+        // kernel's source selection picks the tun's own v6 address via the OIF.
+        if add && dst.is_ipv4() {
+            push_attr(&mut attrs, RTA_PREFSRC, &tun_ip.octets());
+        }
+
+        // nlmsghdr(16) + rtmsg(12) + attrs.
+        let total = 16 + 12 + attrs.len();
+        let mut buf = Vec::with_capacity(total);
+
+        // nlmsghdr.
+        buf.extend_from_slice(&(total as u32).to_ne_bytes());
+        buf.extend_from_slice(&(if add { RTM_NEWROUTE } else { RTM_DELROUTE }).to_ne_bytes());
+        let mut flags = NLM_F_REQUEST | NLM_F_ACK;
+        if add {
+            flags |= NLM_F_CREATE | NLM_F_REPLACE;
+        }
+        buf.extend_from_slice(&flags.to_ne_bytes());
+        buf.extend_from_slice(&seq.to_ne_bytes());
+        buf.extend_from_slice(&0u32.to_ne_bytes()); // nlmsg_pid (kernel picks)
+
+        // rtmsg.
+        let family = if dst.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
+        // LINK scope is only valid for IPv4 here; IPv6 interface routes use
+        // UNIVERSE scope (the kernel rejects link-scoped v6 unicast routes
+        // with a global destination).
+        let scope = if dst.is_ipv4() {
+            RT_SCOPE_LINK
+        } else {
+            RT_SCOPE_UNIVERSE
+        };
+        buf.push(family as u8); // rtm_family
+        buf.push(prefix); // rtm_dst_len
+        buf.push(0); // rtm_src_len
+        buf.push(0); // rtm_tos
+        buf.push(RT_TABLE_MAIN); // rtm_table
+        buf.push(if add { RTPROT_STATIC } else { 0 }); // rtm_protocol
+        buf.push(if add { scope } else { RT_SCOPE_NOWHERE }); // rtm_scope
+        buf.push(if add { RTN_UNICAST } else { 0 }); // rtm_type
+        buf.extend_from_slice(&0u32.to_ne_bytes()); // rtm_flags
+
+        buf.extend_from_slice(&attrs);
+        buf
+    }
+
+    /// Append one rtattr (header + data) padded to a 4-byte boundary.
+    fn push_attr(buf: &mut Vec<u8>, atype: u16, data: &[u8]) {
+        let len = 4 + data.len();
+        buf.extend_from_slice(&(len as u16).to_ne_bytes());
+        buf.extend_from_slice(&atype.to_ne_bytes());
+        buf.extend_from_slice(data);
+        let padded = buf.len().div_ceil(4) * 4;
+        buf.resize(padded, 0);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn add_request_has_expected_header_and_attrs() {
+            let dst = Ipv4Addr::new(1, 2, 3, 4);
+            let src = Ipv4Addr::new(10, 9, 0, 2);
+            let m = build_request(7, true, 12, src, IpAddr::V4(dst), 32);
+
+            // nlmsg_len == buffer length; type == RTM_NEWROUTE(24).
+            assert_eq!(
+                u32::from_ne_bytes([m[0], m[1], m[2], m[3]]) as usize,
+                m.len()
+            );
+            assert_eq!(u16::from_ne_bytes([m[4], m[5]]), 24);
+            // rtm_family == AF_INET, rtm_dst_len == 32 (right after the 16-byte header).
+            assert_eq!(m[16], libc::AF_INET as u8);
+            assert_eq!(m[17], 32);
+            // Three attributes present (DST + OIF + PREFSRC), so the dst octets appear.
+            assert!(m.windows(4).any(|w| w == dst.octets()));
+            assert!(m.windows(4).any(|w| w == src.octets()));
+        }
+
+        #[test]
+        fn del_request_is_delroute_without_prefsrc() {
+            let m = build_request(
+                1,
+                false,
+                5,
+                Ipv4Addr::new(10, 0, 0, 1),
+                IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+                32,
+            );
+            assert_eq!(u16::from_ne_bytes([m[4], m[5]]), 25); // RTM_DELROUTE
+                                                              // DST + OIF only: header(16) + rtmsg(12) + 2*(4+4) = 44.
+            assert_eq!(m.len(), 44);
+            // rtm_scope must be NOWHERE (match-any): a 0 (UNIVERSE) scope
+            // never matches the LINK-scoped IPv4 routes installed by add.
+            assert_eq!(m[22], 255);
+        }
+
+        #[test]
+        fn v6_prefix_request_uses_inet6_family_and_16_byte_dst() {
+            let dst: std::net::Ipv6Addr = "fd42:cafe::".parse().unwrap();
+            let m = build_request(1, true, 9, Ipv4Addr::new(10, 0, 0, 2), IpAddr::V6(dst), 64);
+            assert_eq!(m[16], libc::AF_INET6 as u8);
+            assert_eq!(m[17], 64); // rtm_dst_len
+            assert!(m.windows(16).any(|w| w == dst.octets()));
+            // No PREFSRC for v6: DST(4+16→20) + OIF(8) after header(16)+rtmsg(12).
+            assert_eq!(m.len(), 16 + 12 + 20 + 8);
+        }
+
+        #[test]
+        fn parse_ack_maps_error_code() {
+            // Build a minimal NLMSG_ERROR with error == 0 (ack) then -1 (EPERM-ish).
+            let mut ok = vec![0u8; 20];
+            ok[4] = 2; // NLMSG_ERROR
+            assert!(parse_ack(&ok).is_ok());
+
+            let mut err = vec![0u8; 20];
+            err[4] = 2;
+            err[16..20].copy_from_slice(&(-1i32).to_ne_bytes());
+            assert!(parse_ack(&err).is_err());
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// macOS / BSD: routing messages over a raw PF_ROUTE socket.
+// ---------------------------------------------------------------------------
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod imp {
+    use super::*;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    /// Resolve an interface name to its kernel index.
+    pub fn interface_index(name: &str) -> io::Result<u32> {
+        let cname = std::ffi::CString::new(name)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "tun name has a NUL byte"))?;
+        // SAFETY: `cname` is a valid NUL-terminated C string for the call.
+        let idx = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+        if idx == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(idx)
+        }
+    }
+
+    /// Add (or delete) a `dst/prefix` route via the tun interface.
+    pub fn modify_route(
+        ifindex: u32,
+        tun_ip: Ipv4Addr,
+        dst: IpAddr,
+        prefix: u8,
+        add: bool,
+    ) -> io::Result<()> {
+        let _ = tun_ip; // the interface route picks the tun's source itself
+        let msg = build_message(add, ifindex, dst, prefix);
+
+        // SAFETY: socket()/write() with a correctly sized routing message; the
+        // buffer outlives the call.
+        unsafe {
+            let fd = libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, 0);
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let fd = OwnedFd::from_raw_fd(fd);
+            let written = libc::write(
+                fd.as_raw_fd(),
+                msg.as_ptr() as *const libc::c_void,
+                msg.len(),
+            );
+            if written < 0 {
+                let err = io::Error::last_os_error();
+                // Deleting a route that is already gone is not a real failure.
+                if !add && err.raw_os_error() == Some(libc::ESRCH) {
+                    return Ok(());
+                }
+                // Re-adding an existing route returns EEXIST; treat as success.
+                if add && err.raw_os_error() == Some(libc::EEXIST) {
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        }
+        Ok(())
+    }
+
+    /// Build an `RTM_ADD`/`RTM_DELETE` message: dst (sockaddr_in/_in6), gateway
+    /// (sockaddr_dl carrying the interface index), netmask for `prefix`.
+    fn build_message(add: bool, ifindex: u32, dst: IpAddr, prefix: u8) -> Vec<u8> {
+        const RTM_ADD: u8 = 0x1;
+        const RTM_DELETE: u8 = 0x2;
+        const RTM_VERSION: u8 = 5;
+        const RTF_UP: i32 = 0x1;
+        const RTF_HOST: i32 = 0x4;
+        const RTF_STATIC: i32 = 0x800;
+        const RTA_DST: i32 = 0x1;
+        const RTA_GATEWAY: i32 = 0x2;
+        const RTA_NETMASK: i32 = 0x4;
+
+        let hdr_len = std::mem::size_of::<libc::rt_msghdr>();
+
+        let host = match dst {
+            IpAddr::V4(_) => prefix >= 32,
+            IpAddr::V6(_) => prefix >= 128,
+        };
+        let (sa_dst, sa_mask) = match dst {
+            IpAddr::V4(v4) => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix as u32)
+                };
+                (
+                    sockaddr_in_bytes(v4),
+                    sockaddr_in_bytes(Ipv4Addr::from(mask)),
+                )
+            }
+            IpAddr::V6(v6) => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix as u32)
+                };
+                (
+                    sockaddr_in6_bytes(v6),
+                    sockaddr_in6_bytes(std::net::Ipv6Addr::from(mask)),
+                )
+            }
+        };
+        let sa_gw = sockaddr_dl_bytes(ifindex);
+
+        let total = hdr_len + sa_dst.len() + sa_gw.len() + sa_mask.len();
+
+        // SAFETY: zeroed rt_msghdr is a valid all-fields-zero struct; we then set
+        // the fields we need before serializing it to bytes.
+        let mut hdr: libc::rt_msghdr = unsafe { std::mem::zeroed() };
+        hdr.rtm_msglen = total as u16;
+        hdr.rtm_version = RTM_VERSION;
+        hdr.rtm_type = if add { RTM_ADD } else { RTM_DELETE };
+        hdr.rtm_index = ifindex as u16;
+        hdr.rtm_flags = RTF_UP | RTF_STATIC | if host { RTF_HOST } else { 0 };
+        hdr.rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_NETMASK;
+        hdr.rtm_seq = 1;
+        hdr.rtm_pid = 0;
+
+        let mut buf = Vec::with_capacity(total);
+        // SAFETY: read the header's bytes; rt_msghdr is plain old data.
+        let hdr_bytes =
+            unsafe { std::slice::from_raw_parts(&hdr as *const _ as *const u8, hdr_len) };
+        buf.extend_from_slice(hdr_bytes);
+        buf.extend_from_slice(&sa_dst);
+        buf.extend_from_slice(&sa_gw);
+        buf.extend_from_slice(&sa_mask);
+        buf
+    }
+
+    /// A `sockaddr_in` for `ip`, padded to the routing-socket alignment.
+    fn sockaddr_in_bytes(ip: Ipv4Addr) -> Vec<u8> {
+        // SAFETY: zeroed sockaddr_in is valid; we fill the fields we need.
+        let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        sa.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+        sa.sin_family = libc::AF_INET as u8;
+        sa.sin_addr.s_addr = u32::from_ne_bytes(ip.octets());
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &sa as *const _ as *const u8,
+                std::mem::size_of::<libc::sockaddr_in>(),
+            )
+        };
+        round_up(bytes)
+    }
+
+    /// A `sockaddr_in6` for `ip`, padded to the routing-socket alignment.
+    fn sockaddr_in6_bytes(ip: std::net::Ipv6Addr) -> Vec<u8> {
+        // SAFETY: zeroed sockaddr_in6 is valid; we fill the fields we need.
+        let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+        sa.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+        sa.sin6_family = libc::AF_INET6 as u8;
+        sa.sin6_addr.s6_addr = ip.octets();
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &sa as *const _ as *const u8,
+                std::mem::size_of::<libc::sockaddr_in6>(),
+            )
+        };
+        round_up(bytes)
+    }
+
+    /// A link-level `sockaddr_dl` carrying only the interface index.
+    fn sockaddr_dl_bytes(ifindex: u32) -> Vec<u8> {
+        // SAFETY: zeroed sockaddr_dl is valid; we fill family/len/index.
+        let mut sa: libc::sockaddr_dl = unsafe { std::mem::zeroed() };
+        sa.sdl_len = std::mem::size_of::<libc::sockaddr_dl>() as u8;
+        sa.sdl_family = libc::AF_LINK as u8;
+        sa.sdl_index = ifindex as u16;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                &sa as *const _ as *const u8,
+                std::mem::size_of::<libc::sockaddr_dl>(),
+            )
+        };
+        round_up(bytes)
+    }
+
+    /// Pad a sockaddr to the routing socket's 4-byte rounding (min 4 bytes).
+    fn round_up(bytes: &[u8]) -> Vec<u8> {
+        let len = bytes.len().max(1);
+        let padded = len.div_ceil(4) * 4;
+        let mut v = bytes.to_vec();
+        v.resize(padded, 0);
+        v
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows: per-destination routes via the IP Helper API (CreateIpForwardEntry2).
+// ---------------------------------------------------------------------------
+#[cfg(windows)]
+mod imp {
+    use super::*;
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, ERROR_OBJECT_ALREADY_EXISTS, NO_ERROR};
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        ConvertInterfaceAliasToLuid, ConvertInterfaceLuidToIndex, CreateIpForwardEntry2,
+        DeleteIpForwardEntry2, InitializeIpForwardEntry, MIB_IPFORWARD_ROW2,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
+    use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_INET6};
+
+    /// Resolve a Windows interface alias (e.g. `tun0`) to its interface index.
+    pub fn interface_index(name: &str) -> io::Result<u32> {
+        // The IP Helper API takes the alias as a NUL-terminated UTF-16 string.
+        let wide: Vec<u16> = std::ffi::OsStr::new(name)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+
+        // SAFETY: `wide` is a valid NUL-terminated wide string; `luid` is a
+        // writable, properly-aligned out-parameter for the duration of the call.
+        let mut luid: NET_LUID_LH = unsafe { std::mem::zeroed() };
+        let rc = unsafe { ConvertInterfaceAliasToLuid(wide.as_ptr(), &mut luid) };
+        if rc != NO_ERROR {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+
+        // SAFETY: `luid` is initialized above; `index` is a writable out-param.
+        let mut index: u32 = 0;
+        let rc = unsafe { ConvertInterfaceLuidToIndex(&luid, &mut index) };
+        if rc != NO_ERROR {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        Ok(index)
+    }
+
+    /// Add (or delete) an on-link `dst/prefix` route via the tun interface.
+    ///
+    /// The route's next hop is left unspecified (on-link), so Windows sends
+    /// matching traffic straight out the tun device and selects the tun's own
+    /// address as the source — mirroring the Linux/macOS interface routes.
+    pub fn modify_route(
+        ifindex: u32,
+        tun_ip: Ipv4Addr,
+        dst: IpAddr,
+        prefix: u8,
+        add: bool,
+    ) -> io::Result<()> {
+        let _ = tun_ip; // on-link route: Windows picks the tun's source itself
+
+        // SAFETY: an all-zero MIB_IPFORWARD_ROW2 is a valid (if empty) row;
+        // InitializeIpForwardEntry then fills in the documented field defaults.
+        let mut row: MIB_IPFORWARD_ROW2 = unsafe { std::mem::zeroed() };
+        unsafe { InitializeIpForwardEntry(&mut row) };
+
+        row.InterfaceIndex = ifindex;
+        row.DestinationPrefix.PrefixLength = prefix;
+        row.Metric = 0;
+
+        // SAFETY: we write the matching-family arm of the `SOCKADDR_INET`
+        // unions for both the destination prefix and the (on-link, all-zero)
+        // next hop. The structs are local and fully owned here.
+        unsafe {
+            match dst {
+                IpAddr::V4(v4) => {
+                    let dest = &mut row.DestinationPrefix.Prefix.Ipv4;
+                    dest.sin_family = AF_INET;
+                    dest.sin_addr.S_un.S_addr = u32::from_ne_bytes(v4.octets());
+                    row.NextHop.Ipv4.sin_family = AF_INET;
+                }
+                IpAddr::V6(v6) => {
+                    let dest = &mut row.DestinationPrefix.Prefix.Ipv6;
+                    dest.sin6_family = AF_INET6;
+                    dest.sin6_addr.u.Byte = v6.octets();
+                    row.NextHop.Ipv6.sin6_family = AF_INET6;
+                }
+            }
+        }
+
+        // SAFETY: `row` is a fully-initialized MIB_IPFORWARD_ROW2; the API only
+        // reads from it. The returned WIN32_ERROR is inspected below.
+        let rc = if add {
+            unsafe { CreateIpForwardEntry2(&row) }
+        } else {
+            unsafe { DeleteIpForwardEntry2(&row) }
+        };
+
+        match rc {
+            NO_ERROR => Ok(()),
+            // Re-adding an existing route / deleting a missing one is benign,
+            // matching the macOS EEXIST/ESRCH handling.
+            ERROR_OBJECT_ALREADY_EXISTS if add => Ok(()),
+            ERROR_NOT_FOUND if !add => Ok(()),
+            other => Err(io::Error::from_raw_os_error(other as i32)),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Other platforms: policy routing is unsupported.
+// ---------------------------------------------------------------------------
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "ios", windows)))]
+mod imp {
+    use super::*;
+
+    pub fn interface_index(_name: &str) -> io::Result<u32> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "policy routing is not supported on this platform",
+        ))
+    }
+
+    pub fn modify_route(
+        _ifindex: u32,
+        _tun_ip: Ipv4Addr,
+        _dst: IpAddr,
+        _prefix: u8,
+        _add: bool,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "policy routing is not supported on this platform",
+        ))
+    }
+}
