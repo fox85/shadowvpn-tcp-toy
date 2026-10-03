@@ -62,13 +62,30 @@ fast the link is. Two mechanisms lift that ceiling:
 * **Large socket buffers.** Both ends request 4 MiB `SO_RCVBUF`/`SO_SNDBUF`
   (best-effort; the OS may clamp).
 * **Parallel subflows.** `--subflows N` (default 4, max 16) opens `N` TCP
-  connections and spreads inner connections across them by a 5-tuple hash, so
-  the client uses `N` windows' worth of bandwidth. One inner connection always
-  maps to the same subflow, so its packets stay in order.
+  connections and spreads traffic across them, so the client uses `N` windows'
+  worth of bandwidth. **How** it spreads depends on the inner protocol — see
+  below.
 
 With 4 subflows and 4 MiB buffers, aggregate throughput scales roughly with
 `N` until the link or the CPU saturates. Keepalives go out on every subflow so
 none of them expires from idleness.
+
+### Inner TCP vs inner UDP
+
+A single TCP connection stalls as a unit: lose one segment and everything
+behind it waits for the retransmit. Multiple subflows exist to make that stall
+cheap, and the two inner protocols need opposite treatment:
+
+| Inner protocol | Placement | Why |
+| --- | --- | --- |
+| **TCP** | pinned to one subflow | It is already ordered and recovers from loss itself; reordering it would cause duplicate ACKs and spurious fast retransmits. An outer stall just reads as a slow link. |
+| **UDP** (QUIC, WireGuard, games, VoIP) | spread across every healthy subflow | UDP has no retransmit timer, so a pinned UDP flow sees a *complete blackout* for the duration of the stall. Protocols that estimate RTT read that as a catastrophic path change — QUIC's probe timeout fires and its window collapses, which takes many round trips to rebuild. Spread over `N`, only `1/N` of the packets are caught and the rest keep arriving. |
+
+UDP tolerates reordering (it never promised any, and QUIC numbers its packets
+precisely so it can handle out-of-order arrival), so spreading costs it
+nothing — and it is what makes `--subflows` help a *single* UDP flow rather
+than only many flows at once. Unordered traffic additionally avoids any subflow
+whose send queue is backing up, so a stalled connection is routed around.
 
 Server NAT mode (`--nat`) keys clients by endpoint, so a multi-subflow client
 would look like several clients: **use `subflows=1` with NAT.**

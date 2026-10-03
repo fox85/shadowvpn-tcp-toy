@@ -48,7 +48,7 @@ use shadowvpn::nat::{Ingress, Nat};
 use shadowvpn::obfs::{self, Obfuscator};
 use shadowvpn::pool::host_range;
 use shadowvpn::protocol::{max_datagram_size, max_tcp_frame_size, MAX_IP_PACKET};
-use shadowvpn::transport::Transport;
+use shadowvpn::transport::{FlowHint, Transport};
 use shadowvpn::tun_device::TunDevice;
 
 /// One learned inner-IP → UDP mapping, live only within `lease_ttl`.
@@ -71,6 +71,31 @@ struct ClientEntry {
 /// Bounds the table against a peer that sprays packets from many ports; a
 /// legitimate client uses at most its configured `subflows` (default 4).
 const MAX_PEERS_PER_CLIENT: usize = 16;
+
+/// Where to send packets for one inner destination.
+///
+/// `peers` is every endpoint the destination client is reachable on — a client
+/// with `subflows = 4` has four — and `preferred` is the one its flow hash
+/// selects, i.e. the same subflow the client itself would have picked for this
+/// inner connection. Keeping both lets the send path stay on `preferred`
+/// (preserving order) and only spill to another peer when `preferred` is
+/// backed up, which is what keeps a single UDP 5-tuple such as a QUIC
+/// connection from being capped at one subflow's congestion window.
+#[derive(Clone)]
+struct Route {
+    peers: Vec<SocketAddr>,
+    preferred: SocketAddr,
+}
+
+impl Route {
+    /// A route with exactly one endpoint: no spreading possible.
+    fn single(peer: SocketAddr) -> Self {
+        Self {
+            peers: vec![peer],
+            preferred: peer,
+        }
+    }
+}
 
 /// Learning-mode routing state: the classic per-address client map plus the
 /// mesh subnet-route table (Tailscale-like advertised routes).
@@ -116,23 +141,25 @@ impl Learned {
 
     /// Resolve an inner destination: exact *live* client first, then the
     /// longest-prefix subnet route.
-    /// Resolve an inner destination to the peer that should receive it.
     ///
-    /// When a client is known on several endpoints (its parallel subflows),
-    /// `flow` picks one deterministically: the same inner connection always
-    /// maps to the same subflow, so its packets stay in order, while unrelated
-    /// connections spread across subflows and share the aggregate throughput.
-    fn lookup(&self, dst: IpAddr, flow: u32, now: Instant, ttl: Duration) -> Option<SocketAddr> {
+    /// Returns every endpoint the client is known on (its parallel subflows)
+    /// plus the one its `flow` prefers, so the caller can spread unordered
+    /// traffic when the preferred subflow backs up. A client with one endpoint
+    /// yields a single-peer route, which is the pre-multipath behaviour.
+    fn lookup(&self, dst: IpAddr, flow: u32, now: Instant, ttl: Duration) -> Option<Route> {
         if let Some(entry) = self.clients.get(&dst) {
-            if now.saturating_duration_since(entry.last_seen) <= ttl {
+            if now.saturating_duration_since(entry.last_seen) <= ttl && !entry.peers.is_empty() {
                 let n = entry.peers.len();
-                if n == 0 {
-                    return None;
-                }
-                return Some(entry.peers[(flow % n as u32) as usize]);
+                let preferred = entry.peers[(flow % n as u32) as usize];
+                return Some(Route {
+                    peers: entry.peers.clone(),
+                    preferred,
+                });
             }
         }
-        self.subnets.lookup(dst)
+        self.subnets
+            .lookup(dst)
+            .map(|preferred| Route::single(preferred))
     }
 
     /// Drop mappings whose `last_seen` is older than `ttl`.
@@ -455,13 +482,16 @@ async fn udp_to_tun(
                 if let Some(reply) =
                     handle_control(&routing, &cfg.route_approval, peer, &plaintext, now)
                 {
+                    // Control traffic is tiny and must be ordered, so it goes
+                    // to the peer it came from with no spreading.
                     send_ciphered(
                         &socket_out,
                         cipher,
                         &cfg.master_key,
                         &obfuscator,
                         &encode_control(&reply),
-                        peer,
+                        &Route::single(peer),
+                        None,
                     )
                     .await;
                 }
@@ -482,7 +512,7 @@ async fn udp_to_tun(
                 /// Deliver to this host / the wider network via TUN.
                 Tun,
                 /// Hub-relay straight back out to another client.
-                Relay(SocketAddr),
+                Relay(Route),
                 /// Drop (would bounce back to its sender).
                 Bounce,
             }
@@ -497,15 +527,18 @@ async fn udp_to_tun(
                         } else {
                             debug!("datagram from {peer} is not a parseable IP packet; forwarding");
                         }
-                        match ip_dst(&plaintext)
-                            .and_then(|dst| {
-                                state
-                                    .learned
-                                    .lookup(dst, shadowvpn::transport::flow_hash(&plaintext), now, cfg.lease_ttl)
-                            })
-                        {
-                            // Spoke↔spoke: relay UDP→UDP without touching TUN.
-                            Some(next) if next != peer => Action::Relay(next),
+                        // Classify the *plaintext*: the hint must be computed
+                        // before encryption, because the AEAD salt makes every
+                        // ciphertext look unrelated and the hint would
+                        // otherwise scatter a single inner connection.
+                        let hint = shadowvpn::transport::classify(&plaintext);
+                        match ip_dst(&plaintext).and_then(|dst| {
+                            state
+                                .learned
+                                .lookup(dst, hint.hash, now, cfg.lease_ttl)
+                        }) {
+                            // Spoke↔spoke: relay without touching TUN.
+                            Some(route) if route.preferred != peer => Action::Relay(route),
                             // The destination maps back to the sender itself;
                             // relaying would loop the packet.
                             Some(_) => Action::Bounce,
@@ -532,14 +565,16 @@ async fn udp_to_tun(
                         .await
                         .context("failed to write packet to TUN")?;
                 }
-                Action::Relay(next) => {
+                Action::Relay(route) => {
+                    let hint = shadowvpn::transport::classify(&plaintext);
                     send_ciphered(
                         &socket_out,
                         cipher,
                         &cfg.master_key,
                         &obfuscator,
                         &plaintext,
-                        next,
+                        &route,
+                        Some(hint),
                     )
                     .await;
                 }
@@ -596,26 +631,35 @@ async fn tun_to_udp(
             let now = Instant::now();
 
             // Resolve (and, in NAT mode, rewrite) the destination under the lock.
-            let peer = {
+            //
+            // `hint` is classified from the plaintext *before* encryption: the
+            // AEAD salt makes every ciphertext look unrelated, so classifying
+            // afterwards would hash away the inner 5-tuple this depends on.
+            let hint = shadowvpn::transport::classify(&pkt);
+            let resolved = {
                 let mut guard = routing.lock().unwrap();
                 match &mut *guard {
                     Routing::Learn(state) => {
-                        // Hash the *plaintext* so both directions of one inner
-                        // connection pick the same subflow.
-                        let flow = shadowvpn::transport::flow_hash(&pkt);
-                        ip_dst(&pkt).and_then(|dst| state.learned.lookup(dst, flow, now, cfg.lease_ttl))
+                        // Prefer the subflow the client itself would pick, so
+                        // both directions of one inner connection agree.
+                        ip_dst(&pkt).and_then(|dst| {
+                            state
+                                .learned
+                                .lookup(dst, hint.hash, now, cfg.lease_ttl)
+                        })
                     }
-                    Routing::Nat(nat) => nat.egress(&mut pkt, now),
+                    Routing::Nat(nat) => nat.egress(&mut pkt, now).map(Route::single),
                 }
             };
 
-            let peer = match peer {
-                Some(peer) => peer,
+            let route = match resolved {
+                Some(route) => route,
                 None => {
                     debug!("dropping {n}-byte TUN packet: no known client for its destination");
                     continue;
                 }
             };
+            let peer = route.preferred;
 
             let datagram = match encrypt_packet(cipher, &cfg.master_key, &pkt) {
                 Ok(d) => d,
@@ -631,7 +675,10 @@ async fn tun_to_udp(
                 None => datagram,
             };
 
-            if let Err(err) = socket.send_to(&datagram, &peer).await {
+            if let Err(err) = socket
+                .send_to_hint(&datagram, &route.peers, route.preferred, Some(hint))
+                .await
+            {
                 // A transient send error to one client must not kill the server.
                 warn!("failed to send datagram to {peer}: {err}");
             }
@@ -965,8 +1012,10 @@ async fn send_ciphered(
     master_key: &[u8],
     obfuscator: &Option<Arc<Obfuscator>>,
     plaintext: &[u8],
-    peer: SocketAddr,
+    route: &Route,
+    hint: Option<FlowHint>,
 ) {
+    let peer = route.preferred;
     let datagram = match encrypt_packet(cipher, master_key, plaintext) {
         Ok(d) => d,
         Err(err) => {
@@ -981,7 +1030,10 @@ async fn send_ciphered(
         Some(o) => o.wrap(&datagram),
         None => datagram,
     };
-    if let Err(err) = socket.send_to(&datagram, &peer).await {
+    if let Err(err) = socket
+        .send_to_hint(&datagram, &route.peers, route.preferred, hint)
+        .await
+    {
         warn!("failed to send datagram to {peer}: {err}");
     }
 }

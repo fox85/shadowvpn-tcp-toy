@@ -92,6 +92,13 @@ serde_json = "1.0"
 # UDP socket construction with enlarged SO_RCVBUF/SO_SNDBUF (cross-platform).
 socket2 = "0.6"
 
+# Raw setsockopt for the TCP carrier: congestion-control selection
+# (TCP_CONGESTION) and the unsent-bytes watermark (TCP_NOTSENT_LOWAT). None of
+# these are exposed by `socket2`, and they are the single biggest lever on
+# throughput for a tunnel carrying its own congestion-controlled traffic.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 # Randomness (per-datagram salt).
 rand = "0.10"
 

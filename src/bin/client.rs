@@ -621,15 +621,17 @@ async fn tun_to_net(
                 None => datagram,
             };
 
-            // Pick the subflow *before* encryption hashes happened on plaintext:
-            // `flow_hash` reads the inner 5-tuple, so both directions of one
-            // inner connection land on the same TCP connection (keeping them in
-            // order) while unrelated connections spread across subflows.
-            let flow = shadowvpn::transport::flow_hash(&pkt);
+            // Classify the *plaintext*: the AEAD salt makes every ciphertext
+            // look unrelated, so hashing the encrypted bytes would scatter one
+            // inner connection across all subflows and reorder it. This also
+            // tells the scheduler whether reordering is safe — an inner UDP
+            // flow (QUIC is one 5-tuple) may spill to a freer subflow when its
+            // own backs up, an inner TCP stream may not.
+            let hint = shadowvpn::transport::classify(&pkt);
 
             // A transient path error drops this packet (the peers' transport
             // protocols retransmit); anything else is fatal.
-            if let Err(e) = socket.send_on(&wire, flow).await {
+            if let Err(e) = socket.send_hint(&wire, hint).await {
                 if is_transient_udp_error(&e) {
                     send_failures += 1;
                     if send_failures == 1 {

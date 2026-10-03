@@ -44,6 +44,117 @@ pub const UDP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 /// matters most.
 pub const TCP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
+/// Congestion-control algorithm requested for the outer TCP connections.
+///
+/// **This matters most for latency-sensitive traffic inside the tunnel.** A
+/// loss-based algorithm (Cubic/Reno) halves its window on a single dropped
+/// segment and rebuilds it over many round trips. When the payload is itself a
+/// congestion-controlled protocol — QUIC, or an inner TCP stream — both layers
+/// back off at once and the inner one measures a stall as a huge RTT spike, so
+/// recovery takes even longer. BBR models the path's bandwidth and RTT instead
+/// of reacting to loss, so one lost segment costs a retransmit rather than a
+/// throughput collapse, and it does not fill the bottleneck queue (which is
+/// what makes the inner protocol's RTT estimates unstable in the first place).
+///
+/// Best-effort: kernels without BBR, or without permission to switch, stay on
+/// the default. Failure is logged at debug level and ignored.
+pub const TCP_CC_NAME: &str = "bbr";
+
+/// Cap on bytes sitting in the send queue that have *not* yet been handed to
+/// the NIC ([`TCP_NOTSENT_LOWAT`]).
+///
+/// Without this, "sent" means "copied into a multi-megabyte socket buffer", so
+/// the kernel can hold seconds of traffic on a congested path. That is
+/// bufferbloat: latency explodes while throughput looks fine on average — and
+/// any protocol inside the tunnel that measures RTT (QUIC, inner TCP) sees the
+/// queue, conservatively backs off, and never uses the available bandwidth.
+///
+/// Capping it makes the socket report "not writable" while only a small amount
+/// is genuinely unsent, which pushes backpressure upstream into our own queues
+/// where we can see it and react to it (see [`crate::transport`]'s subflow
+/// selection). Small enough to keep latency honest, large enough to keep the
+/// pipe full.
+pub const TCP_NOTSENT_LOWAT_BYTES: u32 = 32 * 1024;
+
+/// `TCP_CONGESTION` / `TCP_NOTSENT_LOWAT` option numbers on Linux.
+///
+/// Pinned here rather than taken from `libc` because they are stable kernel ABI
+/// but not universally wrapped by every libc release we build against.
+#[cfg(target_os = "linux")]
+mod linux_tcp {
+    pub const TCP_CONGESTION: libc::c_int = 13;
+    pub const TCP_NOTSENT_LOWAT: libc::c_int = 25;
+}
+
+/// Apply the Linux-only TCP tuning that needs raw `setsockopt`.
+///
+/// Both options are advisory: an older kernel, a container that forbids
+/// switching congestion control, or a non-Linux target all fall through
+/// silently. The tunnel works without them — just not as well.
+#[cfg(target_os = "linux")]
+fn tune_tcp_linux(fd: std::os::fd::RawFd) {
+    use std::ffi::CString;
+    // Note: `AsRawFd` lives in `std::os::fd` on unix only; Windows would need
+    // `AsRawSocket`, which is why the whole path above is `cfg`-gated.
+
+    unsafe {
+        // Switch the connection's congestion control to BBR.
+        if let Ok(name) = CString::new(TCP_CC_NAME) {
+            let rc = libc::setsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                linux_tcp::TCP_CONGESTION,
+                name.as_ptr() as *const libc::c_void,
+                name.as_bytes().len() as libc::socklen_t,
+            );
+            if rc != 0 {
+                log::debug!(
+                    "could not set TCP congestion control to {TCP_CC_NAME}: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+        // Cap unsent bytes so the send queue stays shallow.
+        let lowat: u32 = TCP_NOTSENT_LOWAT_BYTES;
+        let rc = libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            linux_tcp::TCP_NOTSENT_LOWAT,
+            &lowat as *const u32 as *const libc::c_void,
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        );
+        if rc != 0 {
+            log::debug!(
+                "could not set TCP_NOTSENT_LOWAT: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// Apply the tuning to an established stream. No-op off Linux (and on Windows
+/// there is no `as_raw_fd` to call, which is the other reason the raw-fd type
+/// never escapes the `cfg` above).
+#[cfg(target_os = "linux")]
+fn tune_stream(stream: &TcpStream) {
+    use std::os::fd::AsRawFd;
+    tune_tcp_linux(stream.as_raw_fd());
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tune_stream(_stream: &TcpStream) {}
+
+/// Same, for a socket that has not been `connect()`ed yet — the point where the
+/// receive window is still negotiable.
+#[cfg(target_os = "linux")]
+fn tune_socket(sock: &Socket) {
+    use std::os::fd::AsRawFd;
+    tune_tcp_linux(sock.as_raw_fd());
+}
+
+#[cfg(not(target_os = "linux"))]
+fn tune_socket(_sock: &Socket) {}
+
 /// Transaction id for the bootstrap server-resolution query. The socket is
 /// connected to a single upstream and only one query is in flight, so the exact
 /// value does not matter; a fixed non-zero id keeps things deterministic.
@@ -161,6 +272,7 @@ pub fn configure_tcp_stream(stream: &TcpStream) -> std::io::Result<()> {
     let sock = socket2::SockRef::from(stream);
     let _ = sock.set_recv_buffer_size(TCP_BUFFER_BYTES);
     let _ = sock.set_send_buffer_size(TCP_BUFFER_BYTES);
+    tune_stream(stream);
     Ok(())
 }
 
@@ -171,6 +283,7 @@ pub fn configure_tcp_stream(stream: &TcpStream) -> std::io::Result<()> {
 fn configure_tcp_socket(sock: &Socket) -> std::io::Result<()> {
     let _ = sock.set_recv_buffer_size(TCP_BUFFER_BYTES);
     let _ = sock.set_send_buffer_size(TCP_BUFFER_BYTES);
+    tune_socket(sock);
     Ok(())
 }
 

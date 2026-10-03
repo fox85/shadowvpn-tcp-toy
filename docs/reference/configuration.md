@@ -62,10 +62,17 @@ Two things lift it:
   (best-effort; the OS may clamp to `net.core.{r,w}mem_max`).
 - **Parallel subflows** (`--subflows N`, default `4`, max `16`): the client
   opens `N` connections and picks one per packet by hashing the inner IP
-  5-tuple (`flow_hash`). One inner connection always maps to the same subflow,
-  so ordering is preserved; unrelated connections spread out and share `N`
-  windows' worth of bandwidth. Keepalives are fanned out to every subflow so
-  none expires from idleness.
+  5-tuple (`transport::classify`). Placement depends on the inner protocol:
+
+  - **inner TCP** is pinned to one subflow, so it stays in order;
+  - **inner UDP** is spread across every subflow that is not backed up. UDP
+    never promised ordering and QUIC numbers its packets so it can absorb
+    reordering, whereas pinning a UDP flow exposes it to that connection's
+    head-of-line stalls *in full* — one lost outer segment blackholes the
+    whole inner flow, which is what makes QUIC collapse its window and crawl.
+    Spreading catches only `1/N` of the packets in any one stall.
+
+  Keepalives are fanned out to every subflow so none expires from idleness.
 
 The server needs no configuration: it learns each client's endpoints as it sees
 traffic and picks among them with the same hash, so return traffic spreads too.
