@@ -90,6 +90,63 @@ whose send queue is backing up, so a stalled connection is routed around.
 Server NAT mode (`--nat`) keys clients by endpoint, so a multi-subflow client
 would look like several clients: **use `subflows=1` with NAT.**
 
+### System tuning: the difference between 50 Mbit/s and 500 Mbit/s
+
+A TCP connection cannot move faster than `receive_window / RTT`. Two Linux
+behaviours combine into a trap that caps a correctly-written tunnel at ~50
+Mbit/s:
+
+1. `SO_RCVBUF` is clamped to `net.core.rmem_max` (**208 KiB** by default), so a
+   4 MiB request silently becomes 208 KiB.
+2. Setting it *at all* sets `SOCK_RCVBUF_LOCK`, which **disables** the kernel's
+   receive-window auto-tuning — the mechanism that would otherwise grow the
+   window to `net.ipv4.tcp_rmem[2]` (~6 MiB).
+
+Together they lock the window at ~416 KiB. At 66 ms RTT that is
+`416 KiB x 8 / 0.066 s ~= 50 Mbit/s` — no matter how fast the link, and no
+matter how many subflows you configure.
+
+ShadowVPN avoids this by using `SO_RCVBUFFORCE` (bypasses the clamp, needs
+`CAP_NET_ADMIN`, i.e. run as root), and by **not** falling back to plain
+`SO_RCVBUF` when that fails — leaving it unset keeps auto-tuning alive, which
+beats a locked 208 KiB window by an order of magnitude. It logs the window that
+actually took effect at startup, and warns when it is below what was asked for:
+
+```text
+WARN TCP receive window is only ~208 KiB (asked for 4096 KiB); this caps a
+     single subflow at roughly 33 Mbit/s per 100 ms of RTT.
+```
+
+If you see that warning, either run as root, or raise the limits:
+
+```sh
+sysctl -w net.core.rmem_max=16777216
+sysctl -w net.core.wmem_max=16777216
+sysctl -w net.ipv4.tcp_rmem='4096 1048576 16777216'
+sysctl -w net.ipv4.tcp_wmem='4096 65536 16777216'
+sysctl -w net.ipv4.tcp_congestion_control=bbr
+sysctl -w net.core.default_qdisc=fq
+```
+
+Also ensure BBR is actually in use (`ss -ti` should show `bbr`), and that the
+qdisc is `fq` — BBR without `fq` performs poorly.
+
+### What limits a single flow
+
+An inner TCP connection is pinned to one subflow (see the table above), so its
+ceiling is that subflow's `window / RTT`. With a 4 MiB window:
+
+| RTT | single inner TCP flow |
+| --- | --- |
+| 10 ms | ~3.3 Gbit/s |
+| 30 ms | ~1.1 Gbit/s |
+| 66 ms | ~500 Mbit/s |
+| 150 ms | ~220 Mbit/s |
+
+So 500 Mbit/s on a long path needs the window fix above plus multiple
+subflows; on a short path one subflow is plenty. Inner UDP spreads across all
+subflows and is not subject to this per-flow ceiling.
+
 ## Disabling encryption (`cipher: "none"`)
 
 ```json

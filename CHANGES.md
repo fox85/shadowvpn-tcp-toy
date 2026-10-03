@@ -200,6 +200,86 @@ QUIC 是单五元组，**只有打散才能让它吃到多子流的带宽**。�
 用 `iperf3 -u -b 200M` 和实际 HTTP/3 下载对照。若确实遇到乱序敏感的应用（极少），
 可把 `spin` 改为按批次递增（如 `counter >> 3`）以降低乱序粒度。
 
+## 内层 TCP 流在 subflows=8/16 下仍只有 ~50 Mbps 的原因与修正
+
+### 根因：`SO_RCVBUF` 是个吞吐陷阱
+
+上一版我"修好 socket 缓冲区"的方式是调用 `set_recv_buffer_size(4 MiB)`。**这恰恰是
+50 Mbps 的直接原因**——Linux 上有两个行为叠加：
+
+1. `SO_RCVBUF` 会被 clamp 到 `net.core.rmem_max`，**默认 208 KiB**。请求 4 MiB，实际
+   只拿到 208 KiB。
+2. **只要调用了 `SO_RCVBUF`，内核就会置 `SOCK_RCVBUF_LOCK`，从而禁用 TCP 接收窗口
+   自动调优**。自动调优本来能把窗口增长到 `net.ipv4.tcp_rmem[2]`（默认约 6 MiB）。
+
+两者叠加 = 窗口锁死在约 416 KiB。按 `window / RTT` 计算，66 ms RTT 下：
+
+```
+416 KiB × 8 / 0.066 s ≈ 50 Mbps
+```
+
+**与你实测的 50 Mbps 精确吻合。** 这也解释了为什么 subflows 从 8 加到 16 没用：每条
+子流的窗口都被锁死，加多少条都一样。
+
+### 修正（三项）
+
+1. **改用 `SO_RCVBUFFORCE`**（`=33`，需 `CAP_NET_ADMIN`，VPN 通常以 root 运行）
+   绕过 `rmem_max` 的 clamp，拿到完整的 4 MiB 窗口。
+2. **失败时故意不设 `SO_RCVBUF`**（关键）
+   若没有 `CAP_NET_ADMIN`，**什么都不设**，让内核自动调优继续工作（上限 6 MiB，是
+   208 KiB 的 ~30 倍）。绝不能回退到普通 `SO_RCVBUF`——那会把窗口锁在 208 KiB，
+   比不设还慢一个数量级。
+   发送缓冲无自动调优可失去，故 `SO_SNDBUFFORCE` 失败时回退普通 `SO_SNDBUF` 即可。
+3. **启动时回读并告警**
+   读回 `SO_RCVBUF`（Linux 返回 `sk_rcvbuf`，是设定值的 2 倍），若低于请求值就
+   warn，并给出按每 100 ms RTT 折算的单子流上限，让"窗口不够"这件事显式可见，
+   而不是表现为莫名的慢。
+
+同时把 `TCP_NOTSENT_LOWAT` 从 32 KiB 提到 **512 KiB**：32 KiB 会让写端在管道未填满时
+就被判定不可写，在高 BDP 路径上直接限流。
+
+另外为有序流加了回退：pinned 子流断连重连中时，改投最空闲的存活子流——重连本身
+已经造成乱序，此时丢弃全部包不如换条路走。
+
+### 期望值：单条内层 TCP 流的天花板
+
+内层 TCP 被钉在单条子流上（保证有序），所以单流上限 = 该子流的 `window / RTT`。
+窗口 4 MiB 时：
+
+| RTT | 单条内层 TCP 流 |
+| --- | --- |
+| 10 ms | ~3.3 Gbps |
+| 30 ms | ~1.1 Gbps |
+| 66 ms | ~500 Mbps |
+| 150 ms | ~220 Mbps |
+
+所以 **66 ms RTT 上想要 500 Mbps，必须窗口达到 4 MiB**（本次修正正好做到这一点），
+且内核确实放行。内层 UDP 会打散到所有子流，不受这个单流上限约束。
+
+### 上线前请确认（sysctl）
+
+若启动日志出现窗口告警，或 `ss -ti` 看不到预期窗口，请执行：
+
+```sh
+sysctl -w net.core.rmem_max=16777216
+sysctl -w net.core.wmem_max=16777216
+sysctl -w net.ipv4.tcp_rmem='4096 1048576 16777216'
+sysctl -w net.ipv4.tcp_wmem='4096 65536 16777216'
+sysctl -w net.ipv4.tcp_congestion_control=bbr
+sysctl -w net.core.default_qdisc=fq
+```
+
+并用 `ss -ti` 确认 `bbr` 生效、**qdisc 为 `fq`**（BBR 配 `fq` 以外的队列表现很差）。
+以 root 运行则无需上述 sysctl，`SO_RCVBUFFORCE` 会直接绕过限制。
+
+### 验证清单
+
+1. 启动日志无 "TCP receive window is only ..." 告警
+2. `ss -ti` 显示 `bbr`，且 `rcv_rtt`/`rcv_space` 达到 MB 级
+3. `iperf3 -c <隧道对端> -P 8` 多条流聚合 ≥ 500 Mbps
+4. `iperf3 -c <隧道对端>` 单条流视 RTT 达到上表预期值
+5. 对比 `--subflows 1 / 4 / 8 / 16` 的聚合吞吐，确认递增
+
 ## 验证状态
 
 本次交付在未安装 Rust 工具链、且无法联网拉取 crates 的环境中完成，**未做真实 `cargo build` 编译验证**；已通过括号配平自检与逐处静态审查。请先在 x64 宿主执行 `cargo build --release` 与 `cargo test` 跑通，再做交叉编译。

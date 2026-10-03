@@ -159,8 +159,23 @@ fn pick_subflow(backlogs: &[usize], hash: u32, spin: u32, ordered: bool) -> usiz
     if n == 0 {
         return 0;
     }
+    /// A subflow with no live connection (reconnecting) reports this backlog.
+    const DEAD: usize = usize::MAX;
+
     if ordered {
-        return (hash % n as u32) as usize;
+        let pinned = (hash % n as u32) as usize;
+        if backlogs[pinned] != DEAD {
+            return pinned;
+        }
+        // The pinned subflow is down. Sending anywhere else reorders this
+        // flow — but the alternative is dropping every packet until the
+        // reconnect completes, and a reconnect already reorders everything
+        // (the whole connection's packets were lost). So prefer *a* working
+        // subflow over none: pick the least loaded one that is alive.
+        return (0..n)
+            .filter(|i| backlogs[*i] != DEAD)
+            .min_by_key(|i| backlogs[*i])
+            .unwrap_or(pinned);
     }
     // Among the least-loaded subflows, spread by `hash ^ spin`. `spin` changes
     // every packet, which is what scatters a *single* flow: without it a flow's
@@ -287,6 +302,8 @@ fn slot_of<'a>(
 fn backlog(slot: Option<&mpsc::Sender<Vec<u8>>>) -> usize {
     match slot {
         Some(tx) => TCP_CHANNEL_DEPTH.saturating_sub(tx.capacity()),
+        // No live connection (reconnecting): `pick_subflow` treats this as
+        // "dead" and avoids it.
         None => usize::MAX,
     }
 }

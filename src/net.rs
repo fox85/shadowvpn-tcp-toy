@@ -31,18 +31,24 @@ use crate::policy::dns;
 /// 4 MiB comfortably covers a ~300 Mbit/s tunnel at tens of milliseconds RTT.
 pub const UDP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
-/// Requested size, in bytes, for each TCP socket's send and receive buffers.
+/// Requested size, in bytes, for each TCP subflow's **receive** buffer.
 ///
-/// This is the single most important knob for TCP throughput: a connection
-/// cannot move faster than `window / RTT`, so the OS default (~64 KiB on a
-/// typical Linux, sometimes less) pins a 30 ms-RTT path at well under 20 Mbit/s
-/// no matter how fast the link is. 4 MiB lets a single subflow reach ~1 Gbit/s
-/// at that RTT, and lets TCP's window scaling and auto-tuning do the rest.
+/// A connection cannot move faster than `receive_window / RTT`, so this is the
+/// single most important knob for throughput — and the easiest one to get
+/// wrong. See [`apply_tcp_buffers`] for why merely *calling* `SO_RCVBUF` can
+/// make throughput dramatically **worse**: the request is clamped to
+/// `net.core.rmem_max` (208 KiB by default) *and* the call disables the
+/// kernel's window auto-tuning, locking the window at a few hundred KiB. On a
+/// 66 ms path that is ~50 Mbit/s no matter how fast the link is.
 ///
-/// Set **before** `connect()` on the client: the receive window is advertised
-/// during the handshake, so raising it afterwards is too late for the path that
-/// matters most.
-pub const TCP_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// 4 MiB is enough for ~500 Mbit/s at 66 ms RTT, and ~1 Gbit/s at 33 ms.
+pub const TCP_RCVBUF_BYTES: usize = 4 * 1024 * 1024;
+
+/// Requested size, in bytes, for each TCP subflow's **send** buffer.
+///
+/// Bounds how much unacknowledged data a subflow may have in flight, so it
+/// caps throughput the same way the receive window does — from the other end.
+pub const TCP_SNDBUF_BYTES: usize = 4 * 1024 * 1024;
 
 /// Congestion-control algorithm requested for the outer TCP connections.
 ///
@@ -74,7 +80,13 @@ pub const TCP_CC_NAME: &str = "bbr";
 /// where we can see it and react to it (see [`crate::transport`]'s subflow
 /// selection). Small enough to keep latency honest, large enough to keep the
 /// pipe full.
-pub const TCP_NOTSENT_LOWAT_BYTES: u32 = 32 * 1024;
+/// 512 KiB, not 32 KiB: the cap is on bytes queued but not yet handed to the
+/// NIC, so too small a value makes the socket report "not writable" while the
+/// pipe still has room and the writer task cannot feed it fast enough — the
+/// path then idles between app writes. 512 KiB is ~8 ms of data at 500 Mbit/s,
+/// frequent enough to stay responsive and deep enough to keep the pipe full.
+/// Lower it (toward 64 KiB) only if latency matters more than throughput.
+pub const TCP_NOTSENT_LOWAT_BYTES: u32 = 512 * 1024;
 
 /// `TCP_CONGESTION` / `TCP_NOTSENT_LOWAT` option numbers on Linux.
 ///
@@ -84,6 +96,106 @@ pub const TCP_NOTSENT_LOWAT_BYTES: u32 = 32 * 1024;
 mod linux_tcp {
     pub const TCP_CONGESTION: libc::c_int = 13;
     pub const TCP_NOTSENT_LOWAT: libc::c_int = 25;
+    /// Like `SO_RCVBUF` but ignores `net.core.rmem_max`; needs `CAP_NET_ADMIN`.
+    /// VPN processes normally run as root, so this is usually available.
+    pub const SO_RCVBUFFORCE: libc::c_int = 33;
+    /// Like `SO_SNDBUF` but ignores `net.core.wmem_max`; needs `CAP_NET_ADMIN`.
+    pub const SO_SNDBUFFORCE: libc::c_int = 32;
+}
+
+/// Set a `u32` socket option; `false` if the kernel refused it.
+#[cfg(target_os = "linux")]
+fn set_opt_u32(fd: libc::c_int, opt: libc::c_int, val: u32) -> bool {
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt,
+            &val as *const u32 as *const libc::c_void,
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        ) == 0
+    }
+}
+
+/// Read a `u32` socket option back, so we can log what actually took effect.
+#[cfg(target_os = "linux")]
+fn get_opt_u32(fd: libc::c_int, opt: libc::c_int) -> Option<u32> {
+    unsafe {
+        let mut val: u32 = 0;
+        let mut len = std::mem::size_of::<u32>() as libc::socklen_t;
+        if libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            opt,
+            &mut val as *mut u32 as *mut libc::c_void,
+            &mut len,
+        ) == 0
+        {
+            Some(val)
+        } else {
+            None
+        }
+    }
+}
+
+/// Size the TCP buffers for one subflow.
+///
+/// **Why this is not just `set_recv_buffer_size()`:** two Linux behaviours
+/// combine to make the naive call a throughput trap.
+///
+/// 1. `SO_RCVBUF` is clamped to `net.core.rmem_max` (208 KiB by default), so a
+///    4 MiB request silently becomes 208 KiB.
+/// 2. Setting it at all sets `SOCK_RCVBUF_LOCK`, which **disables** TCP receive
+///    window auto-tuning. Auto-tuning would otherwise grow the window to
+///    `net.ipv4.tcp_rmem[2]` — 6 MiB by default, ~30x the clamped value.
+///
+/// Doing both at once locks the window at a few hundred KiB and pins
+/// throughput at `window / RTT`. That is the whole "50 Mbit/s" symptom.
+///
+/// So: try `SO_RCVBUFFORCE` first (ignores the clamp, still locks auto-tuning,
+/// but at the full requested size, which is what we want anyway). If it is
+/// unavailable — no `CAP_NET_ADMIN`, container without the capability — then
+/// **set nothing at all** and let auto-tuning do its job, which is far better
+/// than a locked 208 KiB window.
+///
+/// The send buffer has no equivalent auto-tuning to lose, so a clamped value
+/// is still an improvement and the plain option is fine as a fallback.
+#[cfg(target_os = "linux")]
+fn apply_tcp_buffers(fd: libc::c_int) {
+    let rcv_ok = set_opt_u32(fd, linux_tcp::SO_RCVBUFFORCE, TCP_RCVBUF_BYTES as u32);
+    let snd_ok = set_opt_u32(fd, linux_tcp::SO_SNDBUFFORCE, TCP_SNDBUF_BYTES as u32);
+
+    if !rcv_ok {
+        // Deliberately NOT falling back to SO_RCVBUF: see the doc comment.
+        // Auto-tuning (bounded by net.ipv4.tcp_rmem[2], 6 MiB by default) beats
+        // a locked, clamped window by an order of magnitude.
+        log::debug!(
+            "could not force SO_RCVBUF to {} bytes (needs CAP_NET_ADMIN);              leaving it unset so TCP window auto-tuning stays active.              For very long RTT paths raise net.core.rmem_max and net.ipv4.tcp_rmem",
+            TCP_RCVBUF_BYTES
+        );
+    }
+    if !snd_ok {
+        // No auto-tuning to lose here, so take whatever the kernel allows.
+        let _ = set_opt_u32(fd, libc::SO_SNDBUF, TCP_SNDBUF_BYTES as u32);
+    }
+
+    // Report what actually took effect — the number that bounds throughput.
+    // Linux reports sk_rcvbuf, which is 2x the value it was given.
+    if let Some(got) = get_opt_u32(fd, libc::SO_RCVBUF) {
+        let effective = got / 2;
+        if effective < TCP_RCVBUF_BYTES as u32 {
+            let mbit_at_100ms = (got as u64 * 8) / 100_000; // bytes/100ms -> Mbit/s
+            log::warn!(
+                "TCP receive window is only ~{} KiB (asked for {} KiB); \
+                 this caps a single subflow at roughly {} Mbit/s per 100 ms of RTT. \
+                 Raise net.core.rmem_max / net.ipv4.tcp_rmem, or run as root so \
+                 SO_RCVBUFFORCE can bypass the limit",
+                effective / 1024,
+                TCP_RCVBUF_BYTES / 1024,
+                mbit_at_100ms
+            );
+        }
+    }
 }
 
 /// Apply the Linux-only TCP tuning that needs raw `setsockopt`.
@@ -130,30 +242,43 @@ fn tune_tcp_linux(fd: std::os::fd::RawFd) {
             );
         }
     }
+    apply_tcp_buffers(fd);
 }
 
-/// Apply the tuning to an established stream. No-op off Linux (and on Windows
-/// there is no `as_raw_fd` to call, which is the other reason the raw-fd type
-/// never escapes the `cfg` above).
+/// Apply the tuning to an established stream.
 #[cfg(target_os = "linux")]
-fn tune_stream(stream: &TcpStream) {
+fn tune_stream(stream: &TcpStream) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     tune_tcp_linux(stream.as_raw_fd());
+    Ok(())
 }
 
+/// Off Linux there is no `TCP_CONGESTION`/`TCP_NOTSENT_LOWAT`, and no
+/// `SO_RCVBUFFORCE`; plain buffer sizing is all we can do (and no
+/// auto-tuning-locking caveat applies the same way).
 #[cfg(not(target_os = "linux"))]
-fn tune_stream(_stream: &TcpStream) {}
+fn tune_stream(stream: &TcpStream) -> std::io::Result<()> {
+    let sock = socket2::SockRef::from(stream);
+    let _ = sock.set_recv_buffer_size(TCP_RCVBUF_BYTES);
+    let _ = sock.set_send_buffer_size(TCP_SNDBUF_BYTES);
+    Ok(())
+}
 
 /// Same, for a socket that has not been `connect()`ed yet — the point where the
 /// receive window is still negotiable.
 #[cfg(target_os = "linux")]
-fn tune_socket(sock: &Socket) {
+fn tune_socket(sock: &Socket) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     tune_tcp_linux(sock.as_raw_fd());
+    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
-fn tune_socket(_sock: &Socket) {}
+fn tune_socket(sock: &Socket) -> std::io::Result<()> {
+    let _ = sock.set_recv_buffer_size(TCP_RCVBUF_BYTES);
+    let _ = sock.set_send_buffer_size(TCP_SNDBUF_BYTES);
+    Ok(())
+}
 
 /// Transaction id for the bootstrap server-resolution query. The socket is
 /// connected to a single upstream and only one query is in flight, so the exact
@@ -266,13 +391,10 @@ pub fn configure_tcp_stream(stream: &TcpStream) -> std::io::Result<()> {
     // Turn off Nagle: tunnel traffic is a stream of small IP packets, and
     // coalescing them adds a round trip to every interactive packet.
     stream.set_nodelay(true)?;
-    // Belt and braces: if a socket reached us through a path that skipped
-    // `configure_tcp_socket`, raise the buffers here as well. Late is worse
-    // than early but still far better than the OS default.
-    let sock = socket2::SockRef::from(stream);
-    let _ = sock.set_recv_buffer_size(TCP_BUFFER_BYTES);
-    let _ = sock.set_send_buffer_size(TCP_BUFFER_BYTES);
-    tune_stream(stream);
+    // Buffers, congestion control, and the unsent-bytes watermark. Applied even
+    // if `configure_tcp_socket` already ran before the handshake, because that
+    // is the only point at which an accepted socket is guaranteed to be tuned.
+    tune_stream(stream)?;
     Ok(())
 }
 
@@ -281,9 +403,10 @@ pub fn configure_tcp_stream(stream: &TcpStream) -> std::io::Result<()> {
 /// Larger buffers let TCP-inside-the-tunnel open a bigger window and absorb
 /// bursts; failures are logged (via the caller) and never fatal.
 fn configure_tcp_socket(sock: &Socket) -> std::io::Result<()> {
-    let _ = sock.set_recv_buffer_size(TCP_BUFFER_BYTES);
-    let _ = sock.set_send_buffer_size(TCP_BUFFER_BYTES);
-    tune_socket(sock);
+    // Everything (buffers included) is handled by `tune_socket`: on Linux a
+    // plain `SO_RCVBUF` here would be counter-productive — see
+    // `apply_tcp_buffers`.
+    tune_socket(sock)?;
     Ok(())
 }
 
