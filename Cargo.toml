@@ -1,0 +1,125 @@
+[package]
+name = "shadowvpn"
+version = "0.7.0"
+edition = "2021"
+description = "A pre-shared-key (PSK), user-mode VPN using the shadowsocks AEAD wire scheme, over a configurable UDP or TCP carrier."
+license = "MIT"
+repository = "https://github.com/madeye/shadowvpn"
+homepage = "https://github.com/madeye/shadowvpn"
+documentation = "https://docs.rs/shadowvpn"
+readme = "README.md"
+keywords = ["vpn", "tunnel", "shadowsocks", "udp", "tcp", "aead"]
+categories = ["network-programming", "command-line-utilities"]
+# Keep the published package lean: ship the crate sources, README, and LICENSE,
+# but not the CI / Docker test harness, desktop app, or agent skills.
+exclude = ["/docker", "/.github", "/scripts", "/desktop", "/.claude"]
+
+# docs.rs builds with all features so the optional `uri` module is documented.
+# Feature-gate badges are automatic on current rustdoc (the old
+# `feature(doc_auto_cfg)` nightly gate was removed).
+[package.metadata.docs.rs]
+all-features = true
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+
+# Release builds are the ones that move packets, so optimize for the data plane:
+# fat LTO + a single codegen unit let the per-packet crypto/obfs/relay code inline
+# across the lib↔binary crate boundary, which is exactly where the hot path lives.
+# `panic = "abort"` drops unwind tables (smaller binary; a panic in a packet loop
+# is unrecoverable anyway). Tests still run under the dev profile, so this does
+# not affect `cargo test`.
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[lib]
+name = "shadowvpn"
+path = "src/lib.rs"
+
+[[bin]]
+name = "shadowvpn-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "shadowvpn-client"
+path = "src/bin/client.rs"
+
+# Standalone config import/export tool. Built only with `--features uri`, so the
+# server/client builds never pull in the QR/image dependencies.
+[[bin]]
+name = "shadowvpn-uri"
+path = "src/bin/uri.rs"
+required-features = ["uri"]
+
+[features]
+# Off by default: enables the `shadowvpn://` URI / QR tooling (the
+# `shadowvpn-uri` binary and the `shadowvpn::uri` module) and its dependencies.
+default = []
+uri = ["dep:base64", "dep:qrcode", "dep:rqrr", "dep:image"]
+
+[dependencies]
+# Async runtime.
+tokio = { version = "1.52", features = ["full"] }
+
+# Cross-platform async TUN device (macOS utun + Linux). The `async_tokio`
+# feature provides AsyncRead/AsyncWrite + recv/send for the device.
+tun-rs = { version = "2.8", features = ["async_tokio"] }
+
+# AEAD ciphers (RustCrypto). 0.11 line shares the `aead` 0.6 traits.
+# `alloc` enables the `Aead::encrypt`/`decrypt` Vec<u8> convenience methods.
+aead = { version = "0.6", features = ["alloc"] }
+aes-gcm = { version = "0.11.0-rc.4", features = ["alloc"] }
+chacha20poly1305 = { version = "0.11.0-rc.3", features = ["alloc"] }
+
+# Key derivation: HKDF-SHA1 subkeys + MD5-based EVP_BytesToKey master key.
+# SHA-256: assigner probe offset + client state-file name (must be stable).
+hkdf = "0.13"
+sha1 = "0.11"
+sha2 = "0.11"
+md-5 = "0.11"
+
+# Error handling.
+anyhow = "1.0"
+thiserror = "2.0"
+
+# CLI + config.
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# UDP socket construction with enlarged SO_RCVBUF/SO_SNDBUF (cross-platform).
+socket2 = "0.6"
+
+# Randomness (per-datagram salt).
+rand = "0.10"
+
+# Logging.
+log = "0.4"
+env_logger = "0.11"
+maxminddb = "0.28.1"
+ipnetwork = { version = "0.21.1", features = ["serde"] }
+libc = "0.2.186"
+
+# Config import/export as a `shadowvpn://` URI + QR code. Optional: gated by the
+# `uri` feature and only pulled in by the `shadowvpn-uri` tool, so the default
+# server/client builds stay lean (no image-decoding code).
+base64 = { version = "0.22", optional = true }
+qrcode = { version = "0.14", optional = true }
+# QR-image decoding for `import --image` (PNG/JPEG only to slim the build).
+rqrr = { version = "0.9", optional = true }
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+], optional = true }
+
+# Windows policy routing: program per-destination routes via the IP Helper API
+# (CreateIpForwardEntry2) and resolve the tun interface index — no `route.exe`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+] }

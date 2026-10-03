@@ -1,0 +1,901 @@
+# ShadowVPN
+
+A pre-shared-key (PSK), user-mode VPN written in Rust on the
+[`tokio`](https://tokio.rs) async runtime, over a **configurable UDP or TCP
+carrier**.
+
+ShadowVPN is a fixed point-to-point / multi-client tunnel. A TUN-based **client**
+reads IP packets from a virtual interface, encrypts each as a single frame, and
+sends it to the **server**; the server decrypts, routes, and tunnels return
+traffic back. It runs on macOS (utun) and Linux, and the client also runs on
+Windows (TUN via [Wintun](https://www.wintun.net/)), including policy routing
+(below).
+
+The on-wire crypto matches the **shadowsocks.org AEAD UDP scheme** exactly, so
+the construction is spec-correct and interoperable, with one deliberate,
+documented deviation (no SOCKS address header — see below). Encryption can also
+be turned off entirely with `cipher: "none"`.
+
+## Carrier: UDP (default) or TCP
+
+Both ends must agree. Configure with `--transport udp|tcp` or `"transport":
+"udp"|"tcp"` in the JSON config; the default stays `udp`, so existing configs
+keep working unchanged.
+
+| | `udp` (default) | `tcp` |
+|---|---|---|
+| Framing | one datagram = one frame | 2-byte big-endian length + frame |
+| Server | `bind()` + `recv_from`/`send_to` | `listen()`; one connection per client |
+| Client | one connected socket | one connection, auto-reconnect |
+| Loss/reorder | dropped by design | retransmitted by TCP (head-of-line blocking) |
+| NAT/firewall | UDP must be allowed | works where only TCP/443 is allowed |
+
+On TCP each frame is prefixed with a 2-byte big-endian length:
+
+```text
+[ len: u16 big-endian ] ++ [ frame: len bytes ]
+```
+
+where `frame` is byte-for-byte what a UDP datagram would have carried
+(obfuscation header + crypto envelope, or the bare IP packet with
+`cipher: "none"`). The length prefix is **not** encrypted or authenticated: an
+attacker who can inject into the stream can forge a huge length and force a
+disconnect, but cannot alter a frame's contents — the AEAD tag rejects that.
+A frame longer than 65535 bytes cannot be carried and is dropped (keep the TUN
+MTU at its 1400 default and this never happens).
+
+TCP is a good fit when UDP is blocked, rate-limited, or NAT-unfriendly, and a
+bad fit for latency-sensitive traffic: TCP-in-TCP means a lost outer segment
+stalls every inner flow until it is retransmitted.
+
+## Disabling encryption (`cipher: "none"`)
+
+```json
+{ "cipher": "none", "transport": "udp" }
+```
+
+Aliases `plain` / `plaintext` are also accepted. With `none`:
+
+* the wire frame is the raw IP packet — no salt, no tag, no key derivation;
+* no `password` is required (config resolution skips it);
+* both binaries log a loud `ENCRYPTION: DISABLED` warning at startup.
+
+Traffic is then fully readable and forgeable by anyone on the path. Use it only
+on trusted links, or to measure the crypto cost. It is independent of the
+carrier: `udp` and `tcp` both support it.
+
+> **Documentation:** the full doc site lives at
+> [**madeye.github.io/shadowvpn**](https://madeye.github.io/shadowvpn/)
+> (VitePress source in [`docs/`](docs/)) — guides, configuration reference,
+> wire protocol, and benchmarks.
+
+<p align="center">
+  <img src="docs/architecture.svg" alt="ShadowVPN end-to-end data flow" width="100%">
+</p>
+
+---
+
+## Wire protocol
+
+With the default UDP carrier, each datagram on the wire is:
+
+```text
+[ salt (salt_len bytes) ] ++ [ AEAD ciphertext ++ tag (16 bytes) ]
+```
+
+<p align="center">
+  <img src="docs/wire.svg" alt="ShadowVPN on-wire datagram format" width="100%">
+</p>
+
+* **`salt_len == key_len`** of the cipher: 16 bytes for `aes-128-gcm`,
+  32 bytes for `aes-256-gcm` and `chacha20-poly1305`. A fresh random salt is
+  generated for **every** datagram.
+* **Subkey:** `subkey = HKDF-SHA1(ikm = master_key, salt = salt,
+  info = "ss-subkey", L = key_len)`.
+* **Nonce:** the all-zero 12-byte nonce for every UDP packet. This is safe
+  because each datagram has a unique random salt and therefore a unique subkey,
+  so the `(subkey, nonce)` pair is never reused.
+* **Master key:** derived from the password string with shadowsocks'
+  `EVP_BytesToKey` (the OpenSSL legacy MD5-based KDF): repeatedly compute
+  `d_0 = MD5(password)`, `d_i = MD5(d_{i-1} ++ password)`, and concatenate until
+  `key_len` bytes are available. (Implemented in-tree; no external crate.)
+* **Plaintext:** the raw IP packet read from the TUN device. UDP datagram
+  boundaries are the frame boundaries — there is no length prefix, no
+  multiplexing, and no reassembly. One IP packet maps to exactly one datagram.
+
+With `"cipher": "none"` there is no envelope at all: the datagram *is* the IP
+packet. On the TCP carrier the same datagram is sent behind a 2-byte big-endian
+length prefix (see [Carrier](#carrier-udp-default-or-tcp)).
+
+### Deviation from ss-proxy
+
+Standard shadowsocks UDP relays prepend a SOCKS-style target address to the
+plaintext. **ShadowVPN does not.** This is a fixed point-to-point tunnel, not a
+SOCKS proxy: the plaintext is exactly the raw IP packet, with no address header.
+Everything else (salt, HKDF-SHA1 `"ss-subkey"` subkey, zero nonce, AEAD tag)
+matches the shadowsocks UDP AEAD scheme byte-for-byte. This deviation is also
+documented in `src/crypto.rs` and `src/protocol.rs`.
+
+### Keepalive (ShadowVPN convention, not part of the ss spec)
+
+The client periodically sends a tiny encrypted datagram (a 5-byte plaintext: a
+`0x00` marker followed by the client's 4-byte tunnel IP) so that stateful
+NAT/firewall mappings stay open and the server learns the client's current
+source address before any real traffic flows. In the default learning mode the
+announced tunnel IP lets the server map (and re-map, after a NAT rebind) the
+client's UDP address from the keepalive alone; in `--nat` mode the keepalive
+refreshes an existing lease, and the mapping itself is allocated by the first
+real packet. Auto-assign clients (omit `tun_ip` / `peer_ip`) send an
+`AssignRequest` (`00 03`, 39 bytes) on the same interval instead of the
+5-byte keepalive. The server drops any decrypted payload smaller than a
+20-byte IPv4 header, so the keepalive never reaches the TUN write path
+(older 1-byte `0x00` keepalives are still accepted and treated as
+refresh-only).
+
+---
+
+## Supported ciphers
+
+All ciphers are AEAD, from the RustCrypto project. Nonce length is 12 bytes and
+tag length is 16 bytes for all three.
+
+| Cipher name (config)                       | Key / salt length | Crate              |
+|--------------------------------------------|-------------------|--------------------|
+| `aes-128-gcm`                              | 16 bytes          | `aes-gcm`          |
+| `aes-256-gcm`                              | 32 bytes          | `aes-gcm`          |
+| `chacha20-poly1305`                        | 32 bytes          | `chacha20poly1305` |
+
+The alias `chacha20-ietf-poly1305` is accepted and treated as
+`chacha20-poly1305`. The default cipher (when none is specified) is
+`chacha20-poly1305`.
+
+### Hardware acceleration (especially on ARM)
+
+`chacha20-poly1305` uses runtime SIMD feature detection, so it is fast out of
+the box on every target. AES-GCM uses AES-NI automatically on x86-64, **but on
+aarch64 (Raspberry Pi, Apple Silicon, Windows-on-ARM) the ARMv8 AES backend is
+gated behind compile-time target features** — a plain `cargo build` for ARM runs
+AES-GCM in slow constant-time software. So:
+
+* On ARM hardware that lacks (or isn't built for) AES acceleration, prefer
+  `chacha20-poly1305` — it is both faster and simpler there.
+* To use AES-GCM at full speed on ARM, build with the crypto features enabled,
+  e.g. `RUSTFLAGS="-C target-feature=+aes,+neon" cargo build --release` (or
+  `-C target-cpu=native` when building on the device itself).
+
+---
+
+## Carrier obfuscation (optional)
+
+By default the UDP payload on the wire is the bare `salt ++ AEAD` envelope. The
+optional `obfs` field shapes that payload so it doesn't read as an opaque
+random-looking UDP blob, to evade naive protocol classification. It is selected
+with the `obfs` config field and **both ends must agree** — a mismatched peer
+just sees its traffic dropped.
+
+This is **cosmetic framing only**: it adds no security. The AEAD envelope
+underneath is unchanged, and a wrong/absent obfuscation simply fails to decode
+(the packet is dropped before decryption).
+
+| `obfs`   | On the wire                                                                                   | Note                                              |
+|----------|----------------------------------------------------------------------------------------------|---------------------------------------------------|
+| `none`   | the plain `salt ++ AEAD` datagram (default)                                                   | —                                                 |
+| `quic`   | each datagram is wrapped as a **QUIC 1-RTT short-header** packet, so it reads as HTTP/3       | adds a few header bytes; self-describing decode    |
+| `base64` | each datagram is **standard base64**, so the UDP payload is printable ASCII                   | ~33% larger — size the `mtu` down to compensate    |
+
+Set it in both config files (it has no CLI flag):
+
+```json
+{
+  "server": "vpn.example.com:8388",
+  "password": "correct horse battery staple",
+  "obfs": "quic"
+}
+```
+
+The server logs the active mode in its startup banner. The wire formats are
+documented in `src/obfs.rs`.
+
+---
+
+## Configuration
+
+Configuration can come from a JSON config file, CLI flags, or both. **CLI flags
+take precedence over JSON file values.** Defaults are applied for anything not
+supplied.
+
+### Fields
+
+| JSON field    | CLI flag          | Meaning                                                         | Required | Default              |
+|---------------|-------------------|----------------------------------------------------------------|----------|----------------------|
+| `server`      | `--listen` / `--server` | server: UDP bind address; client: remote `host:port`     | yes      | —                    |
+| `password`    | `-k, --password`  | pre-shared password; master key derived from it                | yes      | —                    |
+| `cipher`      | `-m, --cipher`    | AEAD cipher name                                               | no       | `chacha20-poly1305`  |
+| `tun_name`    | `--tun-name`      | explicit TUN interface name (e.g. `utun7`, `tun0`)            | no       | OS picks             |
+| `tun_ip`      | `--tun-ip`        | local IPv4 on the TUN; client may omit with `peer_ip` for auto-assign | server: yes | —          |
+| `tun_netmask` | `--tun-netmask`   | IPv4 netmask for the TUN interface                            | no       | `255.255.255.0`      |
+| `peer_ip`     | `--peer-ip`       | point-to-point peer IPv4 (server: reserved static client; client: server IP) | server: yes | — |
+| `mtu`         | `--mtu`           | TUN interface MTU                                              | no       | `1400`               |
+| `tun_ip6`     | `--tun-ip6`       | optional IPv6 address + prefix on the TUN (e.g. `fd07:7::2/64`) | no      | none                 |
+| `obfs`        | *(config only)*   | carrier obfuscation: `none` \| `quic` \| `base64` (both ends must match) | no | `none`               |
+| `advertise_routes` | `--advertise-routes` | client: subnets behind this client to advertise (comma-sep CIDRs) | no | none            |
+| `accept_routes` | `--accept-routes` | client: install subnet routes pushed by the server            | no       | `false`              |
+| `approve_routes` | `--approve-routes` | server: allowlist of CIDRs approving advertised routes       | no       | none                 |
+| `auto_approve_routes` | `--auto-approve-routes` | server: approve every advertised route              | no       | `false`              |
+
+On the **server** the `server` field is the UDP bind/listen address; on the
+**client** it is the remote server address to connect to. Both binaries accept
+`-c, --config <PATH>` to point at a JSON file.
+
+### Example: server config (`server.json`)
+
+```json
+{
+  "server": "0.0.0.0:8388",
+  "password": "correct horse battery staple",
+  "cipher": "chacha20-poly1305",
+  "tun_name": "utun7",
+  "tun_ip": "10.9.0.1",
+  "tun_netmask": "255.255.255.0",
+  "peer_ip": "10.9.0.2",
+  "mtu": 1400
+}
+```
+
+### Example: client config (`client.json`)
+
+```json
+{
+  "server": "vpn.example.com:8388",
+  "password": "correct horse battery staple",
+  "cipher": "chacha20-poly1305",
+  "tun_name": "utun7",
+  "tun_ip": "10.9.0.2",
+  "tun_netmask": "255.255.255.0",
+  "peer_ip": "10.9.0.1",
+  "mtu": 1400
+}
+```
+
+Note how `tun_ip` and `peer_ip` are mirror images: the server's local tunnel IP
+is the client's peer, and vice versa. On the client you can omit both and let
+the server assign a unique address (see
+[automatic assignment](#automatic-tunnel-ip-assignment)).
+
+### Share a client config as a URI / QR code (`shadowvpn-uri`)
+
+A client config can be exported as a single `shadowvpn://` URI (the config JSON,
+URL-safe Base64) and imported back — handy for moving a config to another device
+by copy-paste or by scanning a QR code. This lives in a **separate
+`shadowvpn-uri` binary** so the server/client builds stay lean; build it with the
+`uri` feature (off by default):
+
+```sh
+cargo build --release --features uri --bin shadowvpn-uri
+
+# Print the shadowvpn:// URI for a config…
+shadowvpn-uri export -c client.json
+
+# …or also render a scannable QR code to the terminal:
+shadowvpn-uri export -c client.json --qr
+
+# Import a URI back into a JSON config (omit -o to print to stdout):
+shadowvpn-uri import 'shadowvpn://…' -o client.json
+
+# Import by decoding a QR-code image instead of pasting the URI:
+shadowvpn-uri import --image config-qr.png -o client.json
+
+# Render an existing shadowvpn:// URI as a terminal QR code (also reads stdin):
+shadowvpn-uri qr 'shadowvpn://…'
+```
+
+The URI carries every config field, but file-path fields (`gfwlist`, `chnroute`,
+`geoip`, `cache_file`) are only meaningful on the host that has those files —
+re-point them after importing. The persisted `node_id` is **not** in the URI; it
+lives in `<config>.state` next to the imported JSON. When several clients share
+one server, omit `tun_ip` and `peer_ip` (below) so one URI works on every
+device, or give each a distinct static `tun_ip`, or run the server with `--nat`
+so every client can share one identical placeholder config (no client↔client).
+
+### Automatic tunnel-IP assignment
+
+Omit `tun_ip` and `peer_ip` on the client and the (learning-mode) server
+assigns a unique tunnel IPv4 — and, when it has a ULA prefix of length ≤ 96,
+a matching IPv6 by embedding the IPv4 in octets `[12..16]`
+(`10.9.0.37` → `fd07:7::a09:25`). Clients can then ping each other through
+the existing hub relay. The same `client.json` / URI / QR can be copied to
+every device; `node_id` lives in `<config>.state`, not in the shared file.
+
+```json
+{
+  "server": "vpn.example.com:8388",
+  "password": "correct horse battery staple"
+}
+```
+
+The server still requires `tun_ip` + `peer_ip`. `peer_ip` (typically `.2`) is
+**reserved** so mixed static/auto fleets do not hand `.2` to the first auto
+laptop. Assignment is always on in learning mode. `--nat` is exclusive (a
+NAT server replies `NatMode`; auto clients exit fatal). Wire: `AssignRequest`
+`00 03` (39 bytes) / `Assign` `00 04` (37 bytes). See the
+[automatic assignment guide](https://madeye.github.io/shadowvpn/guide/auto-assign).
+
+### Multiple clients with one shared config (`--nat`)
+
+By default the server routes by learning each client's inner tunnel source IP, so
+clients must use distinct `tun_ip`s (or omit them and let the server assign).
+With `--nat` the server instead tells clients apart by their UDP endpoint and
+maps each onto a **distinct internal IP** drawn from the TUN subnet, rewriting
+inner addresses as packets pass through. Every client can then run the **same
+static config** (same placeholder `tun_ip`) — no per-client setup, and no
+IP-assignment handshake (0-RTT: a client just starts sending). `--nat` cannot
+be combined with assignment or mesh routing.
+
+**Server** — add `"nat": true` (or `--nat`):
+
+```json
+{
+  "server": "0.0.0.0:8388",
+  "password": "correct horse battery staple",
+  "tun_ip": "10.9.0.1",
+  "tun_netmask": "255.255.255.0",
+  "peer_ip": "10.9.0.2",
+  "nat": true
+}
+```
+
+**Clients** — all run the ordinary static config, identical on every device:
+
+```json
+{
+  "server": "vpn.example.com:8388",
+  "password": "correct horse battery staple",
+  "tun_ip": "10.9.0.2",
+  "tun_netmask": "255.255.255.0",
+  "peer_ip": "10.9.0.1"
+}
+```
+
+How it works: the server keys a mapping by the client's UDP 4-tuple, allocates a
+free internal IP from the subnet (network/broadcast/server excluded), and rewrites
+the inner source on ingress (placeholder → internal) and destination on egress
+(internal → placeholder), fixing IPv4/TCP/UDP checksums incrementally. Mappings
+are refreshed by traffic (data or the client keepalive) and reclaimed after
+`lease_ttl_secs` idle (default 120). Trade-offs: clients **cannot address each
+other** (they share one placeholder — it's hub-and-spoke to the server and beyond),
+and ICMP error payloads that embed the original header aren't rewritten (tunnelled
+PMTU discovery may suffer). The per-packet cost is a couple of checksum deltas,
+negligible next to the AEAD.
+
+### Mesh subnet routing (Tailscale-like)
+
+In the default learning mode, ShadowVPN can share subnet routes between
+clients the way a Tailscale subnet router does — no external control plane:
+
+* **Advertise** — a client announces the IPv4/IPv6 subnets behind it with
+  `--advertise-routes 192.168.200.0/24,fd42:cafe::/64`. Adverts ride the
+  keepalive tick, inside the same AEAD envelope.
+* **Approve** — the server gates advertised routes on an operator policy
+  (`--approve-routes <cidr,…>` allowlist or `--auto-approve-routes`), the
+  stand-in for Tailscale's admin-console route approval. Unapproved routes
+  are held, logged as *awaiting approval*, and never routed or pushed.
+* **Accept** — a client running with `--accept-routes` receives the approved
+  set (split horizon: never its own routes) and installs/removes kernel
+  routes on its TUN automatically — rtnetlink on Linux, `PF_ROUTE` on macOS,
+  IP Helper on Windows — with cleanup on exit.
+
+The server **hub-relays** spoke↔spoke traffic UDP→UDP by longest-prefix match,
+so client↔client and client↔subnet packets never touch the server's TUN and
+need no IP forwarding on the server. Give every node an IPv6 ULA with
+`--tun-ip6` (e.g. `fd07:7::1/64`) to route globally-unique IPv6 prefixes
+between sites whose private IPv4 ranges overlap — or omit client `tun_ip` /
+`peer_ip` and let [automatic assignment](https://madeye.github.io/shadowvpn/guide/auto-assign)
+hand out both families. Mesh routing still works on top of assigned
+addresses. Control messages start with a `0x00` byte (an impossible IP
+version nibble), so old and new peers interoperate — unknown control
+payloads are simply dropped. See the
+[mesh routing guide](https://madeye.github.io/shadowvpn/guide/mesh-routing)
+for the full walkthrough and validation ladder.
+
+### Magic DNS (peer hostnames)
+
+Joined peers resolve by hostname — Tailscale-like Magic DNS, no control plane.
+Each client announces a name (OS hostname, or `hostname` / `--hostname`); the
+server grants it (collisions become `name-aabb`) and pushes the map. The
+client stub answers `A`/`AAAA` for `laptop` and `laptop.svpn`. On by default
+in learning mode; `--no-magic-dns` restores the old behaviour. Host DNS is
+intercepted on the TUN (IPv4 UDP/53); the OS resolver is not rewritten. See the
+[Magic DNS guide](https://madeye.github.io/shadowvpn/guide/magic-dns).
+
+---
+
+## Install (one-liner)
+
+On Linux and macOS, install the latest release binary — server or client —
+with a single command (see
+[`scripts/install.sh`](scripts/install.sh); it detects OS/CPU, installs to
+`/usr/local/bin`, and drops an example config at `/etc/shadowvpn/`):
+
+```sh
+# server
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server
+
+# server, full setup (Linux): generate config (random password, learning
+# mode + auto-assign), install + enable the systemd service, open the
+# firewall port, print the client config (no tun_ip/peer_ip)
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- server --setup
+
+# client (also installs the bundled gfwlist.txt for policy routing)
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- client
+
+# uninstall (add --purge to also remove /etc/shadowvpn configs)
+curl -fsSL https://raw.githubusercontent.com/madeye/shadowvpn/main/scripts/install.sh | sudo bash -s -- uninstall server   # or: client | all
+```
+
+`--service` (after the role) also installs the systemd unit / launchd plist
+(not enabled); `--setup` takes `--port N` / `--obfs quic`;
+`SHADOWVPN_VERSION=vX.Y.Z` pins a release; `PREFIX=~/.local` installs without
+sudo. Windows: use the self-contained release `.zip` instead (client +
+`wintun.dll` + policy data). Full details in the
+[installation guide](https://madeye.github.io/shadowvpn/guide/installation).
+
+---
+
+## Building
+
+Requires a recent stable Rust toolchain (edition 2021).
+
+```sh
+cargo build --release
+```
+
+This produces two binaries:
+
+* `target/release/shadowvpn-server`
+* `target/release/shadowvpn-client`
+
+Run the test suite (crypto + config unit tests):
+
+```sh
+cargo test --lib
+```
+
+It also builds on **Windows** (`x86_64-pc-windows-msvc` / `aarch64-pc-windows-msvc`)
+with the MSVC toolchain; CI builds and tests the Windows target on every push. The
+client's TUN layer uses [Wintun](https://www.wintun.net/), whose `wintun.dll` is
+loaded at runtime and must sit next to `shadowvpn-client.exe` — download the build
+matching the CPU architecture and drop it alongside the binary. See
+[`scripts/`](scripts/) for a ready-made launcher.
+
+### End-to-end test (Docker)
+
+A full data-path test lives under `docker/`. It builds both binaries, starts a
+**server** and a **client** container — each with its own TUN device — on a
+private bridge network, and then pings the server's in-tunnel address from the
+client. A successful, lossless ping exercises the entire path: TUN → encrypt →
+UDP → server → decrypt → TUN, and the reply all the way back.
+
+```sh
+./docker/run-e2e.sh                 # default cipher (chacha20-poly1305)
+./docker/run-e2e.sh aes-256-gcm     # any supported cipher
+```
+
+The containers need `NET_ADMIN` and `/dev/net/tun` (the compose file requests
+both). The script exits non-zero if connectivity through the tunnel fails, so it
+doubles as the CI gate (see `.github/workflows/ci.yml`, which runs it across all
+three ciphers alongside `fmt` + `clippy` + unit tests).
+
+### HTTP/3-over-tunnel test (Docker)
+
+A second, more demanding test proves ShadowVPN carries arbitrary UDP traffic by
+running **real HTTP/3 (QUIC)** through the tunnel. The server enables IP
+forwarding and masquerades the tunnel subnet to the internet; the client routes
+**all** egress through the tunnel (its default route is deleted, so the only way
+out is via ShadowVPN) and fetches a QUIC site with an HTTP/3-only `curl`:
+
+```sh
+./docker/run-e2e-http3.sh                       # default: https://www.cloudflare-quic.com/
+TARGET_URL=https://www.cloudflare-quic.com/ ./docker/run-e2e-http3.sh aes-256-gcm
+```
+
+The test passes when the response is delivered over **HTTP/3** (`http_version=3`);
+the application status code is irrelevant (Cloudflare may bot-block with `403` —
+the point is that the QUIC handshake and HTTP/3 exchange completed over the
+tunnel). It runs on a private bridge network with any host proxy neutralized, so
+QUIC must travel through ShadowVPN rather than around it. In CI this job runs on
+pushes to `main` and on manual dispatch (it depends on external connectivity).
+
+### Policy-routing test (Docker)
+
+Exercises [policy routing](#policy-routing-gfwlist--chinadns--client-linux--macos--windows)
+end to end. The topology puts a source-IP echo server behind the tunnel and
+another on the LAN: a tunneled request shows up as the *server's* address, a
+direct one as the *client's*, so the two paths are unambiguous. It verifies that
+both modes tunnel the selected domain and leave the other direct:
+
+```sh
+./docker/run-e2e-policy.sh             # both gfwlist and chinadns
+./docker/run-e2e-policy.sh gfwlist     # one mode
+```
+
+Fully self-contained (no external network), so CI runs it on every PR.
+
+### Magic DNS test (Docker)
+
+A learning-mode hub named `vpn` and two auto clients (`laptop`, `pi`). Each
+client's stub at `127.0.0.1:53` must answer the other peer (A and AAAA),
+NXDOMAIN an unknown `*.svpn`, and resolve the server name.
+
+```sh
+./docker/run-e2e-magicdns.sh
+```
+
+### Throughput / latency benchmark (Docker + netem)
+
+`docker/run-bench.sh` measures the data plane over an **emulated internet path**.
+A server and client container share a private bridge that stands in for the
+public internet; both apply a `tc netem` qdisc (delay, jitter, loss, bandwidth)
+to it. The client then measures latency and TCP/UDP throughput **through the
+tunnel** and, for comparison, **directly** over the same shaped link — so the gap
+is ShadowVPN's own overhead (crypto + obfs + MTU), not the link.
+
+```sh
+./docker/run-bench.sh                                 # ~100 Mbit broadband-ish
+OBFS=quic CIPHER=aes-256-gcm ./docker/run-bench.sh    # with QUIC carrier shaping
+DELAY=80ms LOSS=1% RATE=20mbit ./docker/run-bench.sh  # lossy mobile-ish link
+```
+
+Scenario knobs (all environment variables, with defaults): `CIPHER`, `OBFS`
+(`none`/`quic`/`base64`), `MTU`, `DELAY` (one-way; RTT ≈ 2×), `JITTER`, `LOSS`,
+`RATE`, `DURATION`, `UDP_RATE`. The run prints a summary table — for example, a
+clean ~100 Mbit/s broadband path (RTT ≈ 48 ms, 0 % loss) with the default
+cipher:
+
+```text
+ Metric                       Tunnel        Direct(WAN)
+ RTT (ms)                     45.2            47.4
+ TCP upload   (Mbit/s)        87.6            92.8
+ TCP download (Mbit/s)        88.2            83.0
+ UDP @ 50M (Mbit/s)           50.0            50.0
+ UDP loss (%)                 0.00            0.00
+```
+
+Both columns cross the same shaped link, so the gap is ShadowVPN's own overhead —
+at ~100 Mbit/s the tunnel runs at or near line rate. When the link is *not* the
+limit the data plane's own ceiling shows: the pipelined relay loops carry single-
+flow TCP at ~1 Gbit/s (≈3× a strict per-packet `recv → crypt → send` loop). Full
+results across ciphers, carrier framing, a lossy/high-latency link, and that
+ceiling comparison — plus how to read them — are in
+[`docs/reference/benchmarks.md`](docs/reference/benchmarks.md) (rendered at
+[madeye.github.io/shadowvpn/reference/benchmarks](https://madeye.github.io/shadowvpn/reference/benchmarks)).
+
+Needs `NET_ADMIN` and `/dev/net/tun` (requested by the compose file). It is a
+measurement tool, not a CI gate — the absolute numbers depend on the host.
+
+---
+
+## Running
+
+Creating a TUN device requires elevated privileges (root on Linux, `sudo` on
+macOS, **Administrator** on Windows). Both binaries log to stderr; set
+`RUST_LOG=debug` for verbose tracing.
+
+### Server
+
+```sh
+sudo ./target/release/shadowvpn-server -c server.json
+```
+
+Or entirely via CLI flags:
+
+```sh
+sudo ./target/release/shadowvpn-server \
+  --listen 0.0.0.0:8388 \
+  --password "correct horse battery staple" \
+  --cipher chacha20-poly1305 \
+  --tun-ip 10.9.0.1 \
+  --peer-ip 10.9.0.2
+```
+
+### Client
+
+```sh
+sudo ./target/release/shadowvpn-client -c client.json
+```
+
+Or via CLI flags:
+
+```sh
+sudo ./target/release/shadowvpn-client \
+  --server vpn.example.com:8388 \
+  --password "correct horse battery staple" \
+  --cipher chacha20-poly1305 \
+  --tun-ip 10.9.0.2 \
+  --peer-ip 10.9.0.1
+```
+
+Once the tunnel is up you can verify connectivity with a ping across the tunnel
+addresses, e.g. from the client `ping 10.9.0.1`.
+
+### Windows (client)
+
+Put `shadowvpn-client.exe`, `wintun.dll` (matching the CPU architecture), and your
+`client.json` in one folder, then run from an **elevated** PowerShell:
+
+```powershell
+.\shadowvpn-client.exe -c client.json
+```
+
+Wintun and the routing/DNS changes need Administrator, so launch the terminal with
+*Run as administrator*. Stop the client with **Ctrl-C** for a graceful shutdown
+(it restores the system resolver, removes the per-destination routes, and saves the
+DNS cache); avoid `taskkill /F`, which skips that cleanup.
+
+The [`scripts/`](scripts/) folder has a self-elevating launcher that does this for
+you — `shadowvpn-client.cmd` (or `shadowvpn-client.ps1 -Config <path>`); see
+[`scripts/README.md`](scripts/README.md).
+
+### Running as a service
+
+Example service definitions live in [`dist/`](dist/): **systemd** units for the
+Linux server and client, and a **launchd** daemon for the macOS client. See
+[`dist/README.md`](dist/README.md) for install steps. Stopping the client service
+is graceful — it restores the system resolver, removes the tunnel routes, and
+saves the DNS cache. On **Windows**, use the launcher in [`scripts/`](scripts/)
+(foreground; stop with Ctrl-C).
+
+### Desktop GUI (experimental)
+
+[`desktop/`](desktop/) has a small [Tauri v2](https://v2.tauri.app/) app that
+wraps `shadowvpn-client` with a profile manager, an elevated launch/kill flow,
+and a live log viewer — no separate reimplementation of the tunnel. It's an
+early, in-progress build (see [`desktop/README.md`](desktop/README.md) for
+current status, prerequisites per OS, and the elevation model). Build and run
+it with:
+
+```sh
+cd desktop/src-tauri && cargo run
+```
+
+---
+
+## Policy routing (gfwlist / chinadns) — client, Linux + macOS + Windows
+
+By default the client is a *full* tunnel: every packet that reaches the TUN is
+encrypted to the server, and what you route into the TUN is your business (see
+the next section). For the common case of "send only some destinations through
+the tunnel", the client has a built-in **policy-routing** mode — no external
+daemon, and no `ipset`/`iptables`/`nft` required.
+
+A small **split-DNS proxy** runs inside the client. For each query it decides
+whether the name should be tunneled and, for those that should be, programs a
+per-destination host route (`<ip>/32`) into the tun device using the OS's native
+routing socket — **rtnetlink on Linux, `PF_ROUTE` on macOS** — so the work is
+done entirely in user mode. The route's source is the tun address, so the
+server's masquerade matches with no client-side NAT. Direct (non-tunneled)
+traffic stays on the normal kernel path untouched, and every route added is
+removed again on exit.
+
+The proxy is built for low latency:
+
+* **Cache** — answers are cached (TTL-respecting, like `dnsmasq`) so repeat
+  lookups skip the upstream round-trip.
+* **chinadns fast-path** — the local and clean resolvers are queried
+  concurrently, but a **domestic answer returns immediately** instead of waiting
+  for the slower tunneled upstream, so China sites resolve at local-DNS speed.
+* **Pre-warm** — on startup a built-in list of common domains is resolved in the
+  background, so their first real lookup (and their tunnel routes) are already
+  hot. Customize with the `prewarm` config list or disable with `--no-prewarm`.
+* **Persistence** — the cache is saved on exit and reloaded on startup
+  (`--cache-file`, default `dns-cache.json` next to the binary; `--no-cache-persist`
+  to disable), so a restart doesn't start cold.
+
+<p align="center">
+  <img src="docs/policy-routing.svg" alt="ShadowVPN client policy routing — control and data plane" width="100%">
+</p>
+
+Two modes:
+
+| Mode       | Decision                                                            | Needs       |
+|------------|--------------------------------------------------------------------|-------------|
+| `gfwlist`  | tunnel names listed in a gfwlist file; everything else is direct    | `--gfwlist` |
+| `chinadns` | query a domestic + a clean resolver; tunnel anything **not** resolving to an in-China address. An optional `--gfwlist` is a force-tunnel override | `--chnroute` or `--geoip` (+ optional `--gfwlist`) |
+| `full`     | no policy routing (the default)                                     | —           |
+
+```sh
+# gfwlist mode: tunnel only the domains in gfwlist.txt
+sudo ./target/release/shadowvpn-client -c client.json \
+  --mode gfwlist --gfwlist /etc/shadowvpn/gfwlist.txt
+
+# chinadns mode: tunnel everything that isn't a China IP (CIDR file)
+sudo ./target/release/shadowvpn-client -c client.json \
+  --mode chinadns --chnroute /etc/shadowvpn/chnroute.txt
+
+# chinadns mode: derive the China set from a GeoLite2 database instead
+sudo ./target/release/shadowvpn-client -c client.json \
+  --mode chinadns --geoip /etc/shadowvpn/GeoLite2-Country.mmdb
+
+# chinadns mode + a gfwlist force list: domains on the list always tunnel,
+# even if the domestic resolver returns an in-China (poisoned) address
+sudo ./target/release/shadowvpn-client -c client.json \
+  --mode chinadns --geoip /etc/shadowvpn/GeoLite2-Country.mmdb \
+  --gfwlist /etc/shadowvpn/gfwlist.txt
+```
+
+Policy routing only takes effect for names resolved **through** the split-DNS
+resolver (that's what installs the routes). Host DNS is intercepted on the TUN
+(IPv4 UDP/53 to any destination, including public resolvers such as `8.8.8.8`);
+the client does **not** rewrite the OS nameserver to `127.0.0.1`.
+
+Relevant config / flags (all client-only; CLI overrides JSON):
+
+| JSON field    | CLI flag        | Meaning                                                    | Default              |
+|---------------|-----------------|-----------------------------------------------------------|----------------------|
+| `mode`        | `--mode`        | `full` \| `gfwlist` \| `chinadns`                          | `full`               |
+| `dns_listen`  | `--dns-listen`  | address the split-DNS proxy listens on                    | `127.0.0.1:53`       |
+| `dns_local`   | `--dns-local`   | domestic / direct DNS upstream                            | `114.114.114.114:53` |
+| `dns_remote`  | `--dns-remote`  | clean DNS upstream (reached through the tunnel)           | `8.8.8.8:53`         |
+| `gfwlist`     | `--gfwlist`     | domain-suffix file (gfwlist mode; optional force-tunnel list in chinadns mode) | —                    |
+| `chnroute`    | `--chnroute`    | China CIDR file (chinadns mode)                           | —                    |
+| `geoip`       | `--geoip`       | GeoLite2/GeoIP2 `.mmdb`; builds the China set from it     | —                    |
+| `geoip_country` | `--geoip-country` | ISO country code to select from the GeoIP database    | `CN`                 |
+| `prewarm`     | `--no-prewarm`  | pre-resolve common domains into the cache on startup        | built-in list        |
+| `cache_file`  | `--cache-file` / `--no-cache-persist` | persist the DNS cache across restarts        | `dns-cache.json` (next to the binary) |
+
+* **gfwlist file** — one domain per line; `#`/`!` comments and a leading `*.`/`.`
+  are accepted (the plain list produced by `gfwlist2dnsmasq`, not the base64
+  blob). A name matches if it equals or is a subdomain of a listed suffix.
+* **chnroute file** — one `a.b.c.d/len` per line (the classic APNIC-derived
+  `chnroute.txt`).
+* **geoip database** — a MaxMind `GeoLite2-Country.mmdb` (or paid GeoIP2). On
+  startup every IPv4 network whose country is `--geoip-country` (default `CN`) is
+  enumerated and merged into the China set, so you don't have to maintain a CIDR
+  file. Takes precedence over `--chnroute` when both are given.
+
+**Bundled data files.** If a `gfwlist.txt` or `GeoLite2-Country.mmdb` sits next
+to the `shadowvpn-client` binary, it is auto-discovered when the relevant mode
+needs it but no path is configured:
+
+* `gfwlist` mode falls back to a bundled `gfwlist.txt` (the routing list).
+* `chinadns` mode with no `--chnroute`/`--geoip` falls back to a bundled
+  `GeoLite2-Country.mmdb`, and — with no `--gfwlist` — also auto-applies a
+  bundled `gfwlist.txt` as its force-tunnel override (names on the list always
+  take the clean tunneled path). This matches the iOS client, whose network
+  extension always injects its bundled `gfwlist.txt` in chinadns mode.
+
+So the packaged clients run these modes out of the box; an explicit
+`--gfwlist`/`--geoip`/`--chnroute` path is only needed to override a bundled
+copy.
+
+The gfwlist is vendored in this repo at [`assets/gfwlist.txt`](assets/gfwlist.txt)
+(regenerate from the upstream AutoProxy list with
+[`scripts/gen-gfwlist.sh`](scripts/gen-gfwlist.sh)); the release packages bundle
+it next to the client — the Unix tarballs and the Windows zip — and the macOS
+desktop `.app` ships it inside `Contents/MacOS/`. The GeoLite2 database is not
+vendored (it is large and separately licensed): the Windows zip downloads it at
+package time, and the desktop `.app` ships a copy.
+
+This needs root / Administrator (to create the tun and edit the routing table)
+and runs on **Linux, macOS, and Windows**; routes are programmed directly via the
+OS routing interface (rtnetlink, `PF_ROUTE`, or the Windows IP Helper API), so no
+`ipset`/`iptables`/`route`/`netsh` binaries are involved for routing. The
+`docker/run-e2e-policy.sh` test exercises both modes end to end. (The server still
+needs forwarding + NAT so tunneled traffic can egress — see below.)
+
+---
+
+## TUN setup, routing, and IP forwarding
+
+ShadowVPN brings the TUN interface up (address, netmask, peer, MTU) but
+**deliberately does not touch the system routing table or `sysctl`**. Doing so
+silently is dangerous and platform-specific. The steps below are what you run
+**outside** the process. The binaries also print these hints at startup.
+
+### Server: enable IP forwarding + NAT
+
+So that tunneled clients can reach the wider network through the server, the
+server host must forward packets and NAT (masquerade) them out its WAN
+interface. Replace `<wan-if>` with the server's real outbound interface (e.g.
+`eth0`).
+
+**Linux:**
+
+```sh
+sudo sysctl -w net.ipv4.ip_forward=1
+sudo iptables -t nat -A POSTROUTING -s 10.9.0.0/24 -o <wan-if> -j MASQUERADE
+```
+
+**macOS:**
+
+```sh
+sudo sysctl -w net.inet.ip.forwarding=1
+# Configure pf NAT, e.g. add to /etc/pf.conf:
+#   nat on <wan-if> from 10.9.0.0/24 to any -> (<wan-if>)
+# then: sudo pfctl -f /etc/pf.conf -e
+```
+
+### Client: route traffic through the tunnel
+
+The client must keep a **host route to the server's IP via the real gateway**
+(otherwise the encrypted UDP would loop back into the tunnel), then route the
+desired destinations via the tunnel peer. The two `/1` routes below override the
+default route without deleting it.
+
+**Linux:**
+
+```sh
+# Keep the server reachable over your real link (replace GW/DEV):
+sudo ip route add <SERVER_IP>/32 via <YOUR_DEFAULT_GW> dev <YOUR_WAN_DEV>
+# Route everything through the tunnel peer:
+sudo ip route add 0.0.0.0/1 via 10.9.0.1
+sudo ip route add 128.0.0.0/1 via 10.9.0.1
+```
+
+**macOS:**
+
+```sh
+# Keep the server reachable over your real link (replace GW):
+sudo route -n add -host <SERVER_IP> <YOUR_DEFAULT_GW>
+# Route everything through the tunnel peer:
+sudo route -n add -net 0.0.0.0/1 10.9.0.1
+sudo route -n add -net 128.0.0.0/1 10.9.0.1
+```
+
+**Windows** (elevated prompt):
+
+```bat
+:: Keep the server reachable over your real link (replace GW):
+route add <SERVER_IP> mask 255.255.255.255 <YOUR_DEFAULT_GW>
+:: Route everything through the tunnel peer:
+route add 0.0.0.0 mask 128.0.0.0 10.9.0.1
+route add 128.0.0.0 mask 128.0.0.0 10.9.0.1
+```
+
+To stop using the tunnel, delete the routes you added. If the server is given as
+a hostname rather than a literal IP, resolve it first and add the host route for
+that resolved IP.
+
+---
+
+## Project layout
+
+```
+src/
+  lib.rs          crate root + module docs
+  crypto.rs       Cipher enum, EVP_BytesToKey, HKDF-SHA1 subkey, AEAD seal/open
+  net.rs          UDP socket construction with enlarged SO_RCVBUF/SO_SNDBUF
+  protocol.rs     tunnel framing constants and buffer sizing
+  config.rs       JSON file + clap CLI config, merge/validate
+  tun_device.rs   async TUN wrapper (tun-rs: macOS utun, Linux, Windows Wintun)
+  magic.rs        Magic DNS: hostname table + peer lookup
+  policy/         client policy routing (gfwlist / chinadns, user-mode)
+    mod.rs        Mode, PolicyConfig, orchestration
+    gfwlist.rs    domain-suffix matching
+    chnroute.rs   China IP range lookup
+    geoip.rs      build the China set from a GeoLite2 .mmdb
+    dns.rs        minimal DNS wire parsing
+    cache.rs      TTL-respecting DNS answer cache
+    proxy.rs      split-DNS proxy + routing decisions (IpSink trait)
+    route.rs      per-dest routes into the tun (rtnetlink / PF_ROUTE / IP Helper API)
+    intercept.rs  user-mode DNS intercept on TUN (IPv4 UDP/53)
+    dnsconf.rs    restore leftover OS resolver (older builds that rewrote DNS)
+  bin/server.rs   server binary: UDP<->TUN forwarding + client routing table
+  bin/client.rs   client binary: TUN<->UDP relay loops + keepalive + policy
+docs/
+  .vitepress/     doc-site config (VitePress, deployed to GitHub Pages)
+  guide/, reference/   documentation pages
+  architecture.svg, wire.svg, policy-routing.svg   diagrams
+dist/
+  systemd/        Linux service units (server + client)
+  launchd/        macOS client daemon
+scripts/
+  install.sh             one-line curl installer/uninstaller (Linux + macOS)
+  shadowvpn-client.ps1   self-elevating Windows client launcher
+  shadowvpn-client.cmd   execution-policy-bypass wrapper for the launcher
+```
+
+---
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
