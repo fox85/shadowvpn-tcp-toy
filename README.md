@@ -200,7 +200,14 @@ ShadowVPN traffic **resets the connection immediately** rather than dropping the
 packet and staying connected:
 
 * a frame that does not match the configured obfuscation;
-* a frame whose AEAD tag does not authenticate (wrong PSK, or a probe).
+* a frame whose AEAD tag does not authenticate (wrong PSK, or a probe);
+* a connection that connects but never produces a valid frame — including one
+  that sends bytes which our 2-byte length prefix reads as a huge frame and
+  then stalls. This is what `curl` and a TLS `ClientHello` look like (their
+  first two bytes ask for ~18 KB and ~5.6 KB that never arrive), so a naive
+  "wait for the frame" server would sit on them until the OS gives up. Those
+  connections are reset within [`STALLED_FRAME_TIMEOUT`]; a peer that sends
+  nothing at all is reset within [`FIRST_FRAME_TIMEOUT`].
 
 The reset sets `SO_LINGER` with a zero timeout and shuts the connection down, so
 the peer gets a RST instead of an orderly FIN — a scanner cannot even complete

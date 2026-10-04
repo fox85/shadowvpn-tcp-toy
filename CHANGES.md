@@ -381,6 +381,71 @@ TCP 载波**没有这个约束**——TCP 字节流由内核按自己的 MSS 分
 AEAD 认证失败在构造上就意味着"对方不持有共享密钥"。配置正确的客户端几乎不可能触发
 （只会是链路位翻转，极罕见），因此立即 RESET 是安全的。
 
+## 修正：服务端 TCP 收到非法包后仍未 RESET（真正的根因）
+
+上一版把 force reset 挂在**数据面 processor** 上（obfs 解包失败 / AEAD 认证失败 →
+reset）。逻辑没错，但**那两条路径永远走不到**，所以实测"仍然默默等到超时"。
+
+### 为什么走不到
+
+TCP 载波用 **2 字节大端长度前缀**定界。`FrameReader::next_frame()` 的内部逻辑是：
+读前缀 → 得到 `len` → 一直 `read` 直到攒够 `len` 字节 → 才返回一帧给上层。
+
+而探测包的首 2 字节会被**当成长度前缀误读**：
+
+| 探测 | 首 2 字节 | 被解析成的 len | 实际发送字节 |
+| --- | --- | --- | --- |
+| `curl http://host:port/` | `"GE"` | **18245** | ~78 |
+| TLS ClientHello | `0x16 0x03` | **5635** | ~300 |
+
+于是 `next_frame()` 永远等不到那 18245 / 5635 字节，**卡在内部的 `read().await` 上**。
+processor 收不到任何帧 → 自然不会触发 force_reset → 只能等 OS 超时。
+
+这正是"服务端只是默默等待"的全部原因。
+
+### 修正
+
+1. **`FrameReader` 支持读超时**
+   新增 `ReadDeadline` 策略，区分两种"等待"：
+   - `Unverified`（首帧尚未通过校验）：**每次 read 都有上限**。静默连接 10s
+     （`FIRST_FRAME_TIMEOUT`），已收到部分字节则收紧到 3s（`STALLED_FRAME_TIMEOUT`）。
+   - `Verified`（已认证）：空闲是正常的（客户端在 keepalive 之间本来就不发东西），
+     所以**只对"半截帧"设 3s 上限**，空闲不设限——否则会误杀正常客户端。
+   超时返回 `NextFrame::Stalled`，不再无限阻塞。
+
+2. **首帧内容校验（`Validator`）**
+   光有超时还不够：若探测恰好凑够了自己谎报的长度（例如发 `len=4` 再发 4 字节垃圾），
+   会组成一帧并交给 processor。所以在读循环里对**第一个帧**直接做校验：
+   de-obfs → decrypt → 通过才算合法。失败立即 reset。
+   只校验首帧——扫描器无法造出能认证通过的首帧，抓得住所有探测，又不给数据面每包
+   加 AEAD 开销。
+   `cipher=none` 时没有 AEAD 可依，改为形态校验：是 IP 包（`len>=20 && ip_src` 可解析）
+   **或**是控制消息（`mesh::is_control`，keepalive/assign 不是 IP 包，却是客户端连上来
+   发的第一件事——这一条漏了会把合法客户端首帧误杀）。
+
+3. **两条路径都触发 reset**：`Stalled` 与首帧校验失败，都调 `abort.fire()`。
+
+### 效果
+
+| 探测方式 | 上一版 | 修正后 |
+| --- | --- | --- |
+| `curl`（"GE" → 18245 字节） | 挂起到 OS 超时 | **~3s 内 RST** |
+| TLS ClientHello（5635 字节） | 挂起到 OS 超时 | **~3s 内 RST** |
+| 连上什么都不发 | 挂起到 OS 超时 | **10s 内 RST** |
+| 凑够长度的垃圾帧 | processor 兜底 reset | 首帧校验即 reset |
+
+### 验证方法
+
+```sh
+# 服务端 TCP 模式运行后
+time curl -v http://<server>:8388/      # 应在 3s 内 Connection reset by peer
+openssl s_client -connect <server>:8388 # 同上
+nc -v <server>:8388 < /dev/null         # 静默连接，10s 内 reset
+```
+
+服务端日志会出现 `tcp: peer did not produce a complete frame in time (partial
+frame stalled), resetting` 或 `tcp: first frame failed validation, resetting`。
+
 ## 编译时开启硬件 AES
 
 引用说明："To use AES-GCM at full speed on ARM, build with the crypto features

@@ -93,6 +93,32 @@ pub const TCP_LEN_PREFIX: usize = 2;
 /// which case the packet is dropped (see [`FrameReader`]).
 pub const MAX_TCP_FRAME: usize = u16::MAX as usize;
 
+/// How long a fresh TCP connection has to deliver its **first** frame before we
+/// reset it.
+///
+/// A real client sends a keepalive the moment it connects (its keepalive ticker
+/// fires immediately), so a connection that stays silent this long is not one
+/// of ours — typically a port scanner completing a handshake and then waiting.
+/// Resetting keeps the probe from holding a connection open indefinitely.
+pub const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a **partially received** frame may stay incomplete before we reset.
+///
+/// This is what catches the common probes. `curl` to the port sends
+/// `GET / HTTP/1.1...`; read as a length prefix, `"GE"` means 18245 bytes, so
+/// the reader waits for 18245 bytes that never come. A TLS `ClientHello`
+/// (`0x16 0x03`...) asks for 5635. Neither ever completes, and without this
+/// deadline the connection just sits there until the peer gives up — the
+/// "silently waits until timeout" behaviour.
+///
+/// A legitimate sender never leaves a partial frame: our writer emits whole
+/// frames, and ordinary TCP segmentation is resolved in milliseconds. Several
+/// seconds of a stalled partial frame is unambiguous.
+///
+/// This applies at any point in a connection's life, not just at the start —
+/// an established peer that starts sending garbage is dropped the same way.
+pub const STALLED_FRAME_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Accept-queue backlog for the server's TCP listener.
 pub const TCP_BACKLOG: u32 = 1024;
 
@@ -222,6 +248,18 @@ fn pick_subflow(backlogs: &[usize], hash: u32, spin: u32, ordered: bool) -> usiz
 /// genuinely reorder-proof), or raise it if a specific application is sensitive.
 pub const UDP_ROTATE_EVERY: u32 = 16;
 
+/// Checks whether a received frame is well-formed ShadowVPN traffic.
+///
+/// Used only for the **first** frame of a connection: that is enough to catch
+/// every probe (a scanner cannot produce a frame that authenticates), and it
+/// keeps the cost off the steady-state path — validating every frame would
+/// double the per-packet AEAD work at exactly the rates we care about.
+///
+/// Once a connection has produced one valid frame it is treated as established
+/// and is no longer re-validated; a peer that holds the shared key is not a
+/// probe, and corruption beyond that point is handled by the processor.
+pub type Validator = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
 /// How a packet should be placed on the subflows.
 ///
 /// Returned by [`classify`] and passed down to the send path, because **the
@@ -335,6 +373,34 @@ fn backlog(slot: Option<&mpsc::Sender<Vec<u8>>>) -> usize {
     }
 }
 
+/// How long [`FrameReader::next_frame`] may block on a read.
+///
+/// The distinction matters because a connection that is merely **idle** is
+/// healthy — a client sits quiet between keepalives — while one that is
+/// **mid-frame and stalled** is not. Timing out the former would break real
+/// clients; timing out the latter is what rejects probes.
+#[derive(Clone, Copy, Debug)]
+pub enum ReadDeadline {
+    /// The peer has not yet produced a frame that authenticates, so bound
+    /// *every* read: neither silence nor a trickle is acceptable.
+    Unverified,
+    /// The peer has proved itself. Idling is normal, but a frame that is half
+    /// delivered is not, so only those reads are bounded.
+    Verified,
+}
+
+/// Outcome of one [`FrameReader::next_frame`] attempt.
+#[derive(Debug)]
+enum NextFrame {
+    /// A complete frame of this length was copied into the caller's buffer.
+    Frame(usize),
+    /// The peer closed the stream cleanly.
+    Eof,
+    /// Bytes are buffered but the rest of the frame did not arrive in time.
+    /// This is what a probe looks like, and the caller should reset.
+    Stalled,
+}
+
 /// A framed reader over any byte stream: one `read(2)` yields many frames.
 ///
 /// TCP hands us bytes, not messages. The naive approach — `read_exact` the
@@ -360,11 +426,32 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
         }
     }
 
-    /// Copy the next complete frame into `out`, returning its length.
+    /// Whether we are holding bytes that do not yet form a whole frame.
     ///
-    /// `Ok(None)` means the peer closed the stream. Frames larger than `out`
-    /// are drained and skipped so the stream stays synchronised.
-    async fn next_frame(&mut self, out: &mut [u8]) -> std::io::Result<Option<usize>> {
+    /// A probe's bytes almost always land here: they parse as a length prefix
+    /// asking for far more than the probe will ever send. Seeing this persist
+    /// is what tells us to reset instead of waiting.
+    fn has_partial(&self) -> bool {
+        self.end > self.start
+    }
+
+    /// Copy the next complete frame into `out`.
+    ///
+    /// `deadline`, when set, bounds **each blocking read**. That is the only
+    /// place a timeout can be applied: this method loops internally until a
+    /// whole frame is assembled, so a caller sitting outside it never gets a
+    /// chance to notice that we are stuck holding a partial frame — which is
+    /// exactly what a probe produces. Timing out the read is what surfaces the
+    /// stall; see [`ReadDeadline`] for how the bound differs before and after
+    /// the peer has authenticated.
+    ///
+    /// Frames larger than `out` are drained and skipped so the stream stays
+    /// synchronised.
+    async fn next_frame(
+        &mut self,
+        out: &mut [u8],
+        deadline: Option<ReadDeadline>,
+    ) -> std::io::Result<NextFrame> {
         loop {
             // 1. Do we already hold a whole frame?
             if self.end - self.start >= TCP_LEN_PREFIX {
@@ -386,7 +473,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                     }
                     out[..len].copy_from_slice(&self.buf[body..body + len]);
                     self.start = body + len;
-                    return Ok(Some(len));
+                    return Ok(NextFrame::Frame(len));
                 }
             }
 
@@ -404,9 +491,32 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                     "TCP frame exceeds the read buffer; stream is corrupt",
                 ));
             }
-            let n = self.inner.read(&mut self.buf[self.end..]).await?;
+            // Once bytes are buffered a frame is in progress and must finish
+            // quickly. Tightening the deadline mid-frame is what makes a probe
+            // fail in seconds: `curl` to the port sends "GET / HTTP/1.1...",
+            // and "GE" read as a length prefix asks for 18245 bytes that never
+            // arrive (a TLS ClientHello asks for 5635). Before any bytes have
+            // arrived, an unverified peer gets the longer first-frame window.
+            let per_read = match deadline {
+                Some(ReadDeadline::Unverified) => Some(if self.has_partial() {
+                    STALLED_FRAME_TIMEOUT
+                } else {
+                    FIRST_FRAME_TIMEOUT
+                }),
+                Some(ReadDeadline::Verified) if self.has_partial() => Some(STALLED_FRAME_TIMEOUT),
+                // Verified and idle: wait as long as it takes.
+                _ => None,
+            };
+            let read = self.inner.read(&mut self.buf[self.end..]);
+            let n = match per_read {
+                Some(d) => match tokio::time::timeout(d, read).await {
+                    Ok(r) => r?,
+                    Err(_) => return Ok(NextFrame::Stalled),
+                },
+                None => read.await?,
+            };
             if n == 0 {
-                return Ok(None); // clean EOF
+                return Ok(NextFrame::Eof); // clean EOF
             }
             self.end += n;
         }
@@ -438,7 +548,8 @@ async fn tcp_read_loop<R, T, F>(
     inbound: mpsc::Sender<T>,
     tag: F,
     buf_len: usize,
-    abort: Arc<Notify>,
+    abort: Arc<ConnAbort>,
+    validator: Option<Validator>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -446,22 +557,63 @@ where
 {
     let mut reader = FrameReader::new(reader);
     let mut frame = vec![0u8; buf_len];
+    let signal = abort.signal();
+    // Only the first frame is checked; see `Validator`.
+    let mut authenticated = validator.is_none();
+
     loop {
-        // Also watch `abort`: a force-reset cannot rely on the peer to close,
-        // and the whole point is to stop reading from it immediately.
-        let n = tokio::select! {
-            r = reader.next_frame(&mut frame) => match r? {
-                Some(n) => n,
-                None => return Ok(()), // peer closed
-            },
-            _ = abort.notified() => {
-                debug!("tcp: read loop aborted by force-reset");
+        // A real client speaks up at once (keepalive/assign on connect), so an
+        // unverified connection that neither completes a frame nor shuts down
+        // is a probe. Once verified, only a half-delivered frame is suspect.
+        let deadline = if authenticated {
+            Some(ReadDeadline::Verified)
+        } else {
+            Some(ReadDeadline::Unverified)
+        };
+
+        // Note the state *before* awaiting: `fut` borrows `reader`, and it is
+        // still alive while the select's handler runs.
+        let had_partial = reader.has_partial();
+        let fut = reader.next_frame(&mut frame, deadline);
+        let res = tokio::select! {
+            _ = signal.notified() => return Ok(()),
+            r = fut => r?,
+        };
+
+        let n = match res {
+            NextFrame::Frame(n) => n,
+            NextFrame::Eof => return Ok(()), // peer closed
+            NextFrame::Stalled => {
+                warn!(
+                    "tcp: peer did not produce a complete frame in time{}, resetting",
+                    if had_partial {
+                        " (partial frame stalled)"
+                    } else {
+                        ""
+                    }
+                );
+                abort.fire();
                 return Ok(());
             }
         };
         if n == 0 {
             continue;
         }
+
+        // Reject a first frame that is not ShadowVPN traffic. This covers the
+        // probe that *does* complete a frame: enough bytes to satisfy its own
+        // bogus length prefix, but nothing that authenticates.
+        if !authenticated {
+            if let Some(ref check) = validator {
+                if !check(&frame[..n]) {
+                    warn!("tcp: first frame failed validation, resetting");
+                    abort.fire();
+                    return Ok(());
+                }
+            }
+            authenticated = true;
+        }
+
         if inbound.send(tag(frame[..n].to_vec())).await.is_err() {
             return Ok(()); // consumer gone
         }
@@ -537,6 +689,32 @@ struct ConnAbort {
 }
 
 impl ConnAbort {
+    /// Build a teardown handle with no socket attached.
+    ///
+    /// Use [`ConnAbort::with_fd`] when the connection should emit a real RST;
+    /// the client uses this one, since it reconnects on its own and never
+    /// force-resets.
+    fn new() -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+            #[cfg(unix)]
+            fd: None,
+        }
+    }
+
+    /// Attach a duplicate of the connection's socket so [`ConnAbort::fire`]
+    /// emits a RST.
+    #[cfg(unix)]
+    fn with_fd(mut self, fd: Option<std::os::fd::OwnedFd>) -> Self {
+        self.fd = fd;
+        self
+    }
+
+    /// The signal the reader and writer loops wait on.
+    fn signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.notify)
+    }
+
     /// Stop the connection now, and make the close send RST.
     fn fire(&self) {
         #[cfg(unix)]
@@ -572,6 +750,8 @@ pub struct TcpHub {
     outbound: RwLock<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>,
     /// Per-peer teardown handles for [`TcpHub::force_reset`].
     aborts: RwLock<HashMap<SocketAddr, Arc<ConnAbort>>>,
+    /// Applied to each connection's first frame; see [`Validator`].
+    validator: Option<Validator>,
     /// Monotonic counter mixed into unordered subflow selection (see
     /// [`pick_subflow`]).
     spins: AtomicU32,
@@ -579,13 +759,21 @@ pub struct TcpHub {
 
 impl TcpHub {
     /// Bind a listener on `addr` and start the accept loop.
-    pub async fn bind(addr: SocketAddr, buf_len: usize) -> std::io::Result<Arc<Self>> {
+    ///
+    /// `validator` is applied to every connection's first frame; a frame that
+    /// fails it resets the connection (see [`Validator`]).
+    pub async fn bind(
+        addr: SocketAddr,
+        buf_len: usize,
+        validator: Option<Validator>,
+    ) -> std::io::Result<Arc<Self>> {
         let listener: TcpListener = bind_tcp_listener(addr)?;
         let (tx, rx) = mpsc::channel(TCP_CHANNEL_DEPTH);
         let hub = Arc::new(Self {
             inbound: Mutex::new(rx),
             outbound: RwLock::new(HashMap::new()),
             aborts: RwLock::new(HashMap::new()),
+            validator,
             spins: AtomicU32::new(0),
         });
 
@@ -612,11 +800,10 @@ impl TcpHub {
                                 Some(unsafe { OwnedFd::from_raw_fd(dupped) })
                             }
                         };
-                        let abort = Arc::new(ConnAbort {
-                            notify: Arc::new(Notify::new()),
-                            #[cfg(unix)]
-                            fd: dup_fd,
-                        });
+                        #[cfg(unix)]
+                        let abort = Arc::new(ConnAbort::new().with_fd(dup_fd));
+                        #[cfg(not(unix))]
+                        let abort = Arc::new(ConnAbort::new());
                         hub2.aborts.write().await.insert(peer, Arc::clone(&abort));
 
                         let (reader, writer) = stream.into_split();
@@ -626,13 +813,17 @@ impl TcpHub {
                         let hub3 = Arc::clone(&hub2);
                         let inbound_tx = tx.clone();
                         let read_abort = Arc::clone(&abort);
+                        // Cloned before the spawn so the task owns it outright
+                        // (`hub2` has to stay with the accept loop).
+                        let conn_validator = hub2.validator.clone();
                         tokio::spawn(async move {
                             if let Err(e) = tcp_read_loop(
                                 reader,
                                 inbound_tx,
                                 move |p| (peer, p),
                                 buf_len,
-                                read_abort.notify.clone(),
+                                read_abort,
+                                conn_validator,
                             )
                             .await
                             {
@@ -641,11 +832,7 @@ impl TcpHub {
                             hub3.outbound.write().await.remove(&peer);
                             hub3.aborts.write().await.remove(&peer);
                         });
-                        tokio::spawn(tcp_write_loop(
-                            writer,
-                            out_rx,
-                            Arc::clone(&abort.notify),
-                        ));
+                        tokio::spawn(tcp_write_loop(writer, out_rx, abort.signal()));
                         info!("tcp: accepted connection from {peer}");
                     }
                     Err(e) => {
@@ -853,12 +1040,13 @@ impl TcpClient {
         let (reader, writer) = stream.into_split();
 
         // The client never force-resets (it has exactly one server, and its
-        // supervisor reconnects on its own), but both loops take an abort so
-        // the same functions serve either end.
-        let abort = Arc::new(Notify::new());
+        // supervisor reconnects on its own), but both loops take a teardown
+        // handle so the same functions serve either end. No validator: the
+        // client trusts the server it dialled.
+        let abort = Arc::new(ConnAbort::new());
 
         let (out_tx, out_rx) = mpsc::channel(TCP_CHANNEL_DEPTH);
-        tokio::spawn(tcp_write_loop(writer, out_rx, Arc::clone(&abort)));
+        tokio::spawn(tcp_write_loop(writer, out_rx, abort.signal()));
 
         let tx = inbound_tx.clone();
         let reader_task = tokio::spawn(tcp_read_loop(
@@ -867,6 +1055,7 @@ impl TcpClient {
             |p| p,
             MAX_TCP_FRAME + crate::protocol::TCP_LEN_PREFIX,
             abort,
+            None,
         ));
 
         Ok((out_tx, local, reader_task))
@@ -1041,9 +1230,14 @@ impl Transport {
     }
 
     /// Start a TCP listener bound to `addr`; `buf_len` sizes per-connection read
-    /// buffers.
-    pub async fn tcp_server(addr: SocketAddr, buf_len: usize) -> std::io::Result<Self> {
-        Ok(Transport::TcpServer(TcpHub::bind(addr, buf_len).await?))
+    /// buffers. `validator` rejects a connection's first frame if it is not
+    /// ShadowVPN traffic.
+    pub async fn tcp_server(
+        addr: SocketAddr,
+        buf_len: usize,
+        validator: Option<Validator>,
+    ) -> std::io::Result<Self> {
+        Ok(Transport::TcpServer(TcpHub::bind(addr, buf_len, validator).await?))
     }
 
     /// Dial a TCP server at `addr` with `subflows` parallel connections.

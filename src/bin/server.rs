@@ -259,6 +259,64 @@ async fn run(cfg: ServerConfig) -> Result<()> {
         .with_context(|| format!("resolving listen address {}", cfg.listen))?
         .next()
         .with_context(|| format!("no address resolved for {}", cfg.listen))?;
+    // Carrier obfuscation, matching the client. When enabled, datagrams on the
+    // wire look like QUIC/HTTP3 short-header packets; `None` is the plain
+    // `salt ++ AEAD` envelope.
+    //
+    // Built before the transport because the TCP carrier validates each new
+    // connection's first frame, and that check has to undo obfuscation first.
+    let obfuscator: Option<Arc<Obfuscator>> = cfg
+        .obfs
+        .as_deref()
+        .and_then(Obfuscator::from_name)
+        .map(Arc::new);
+    if let Some(name) = cfg.obfs.as_deref() {
+        info!("  obfuscation    : {name} datagram shaping ENABLED");
+    }
+
+    // Gatekeeper for the TCP carrier: a connection whose *first* frame does not
+    // decrypt (and, when encryption is off, does not even look like an IP
+    // packet) is a probe, and gets reset immediately.
+    //
+    // Only the first frame is checked — a scanner cannot produce one that
+    // authenticates, so this catches every probe, while leaving the per-packet
+    // AEAD work in the data path untouched.
+    let validator: Option<shadowvpn::transport::Validator> = if cfg.transport.is_tcp() {
+        let cipher = cfg.cipher;
+        let master_key: Arc<[u8]> = Arc::from(cfg.master_key.as_slice());
+        let obfs = obfuscator.clone();
+        Some(Arc::new(move |frame: &[u8]| {
+            let decoded;
+            let datagram: &[u8] = match obfs {
+                Some(ref o) => match o.unwrap(frame) {
+                    Some(inner) => {
+                        decoded = inner;
+                        &decoded
+                    }
+                    None => return false,
+                },
+                None => frame,
+            };
+            match decrypt_packet(cipher, &master_key, datagram) {
+                Ok(pt) => {
+                    if cipher.is_none() {
+                        // Nothing was authenticated, so accept only a payload
+                        // that is plausibly ours: an IP packet, or a control
+                        // message (keepalive/assign — NOT an IP packet, and
+                        // the very first thing a client sends). Without this
+                        // `cipher=none` would wave every probe through.
+                        (pt.len() >= 20 && ip_src(&pt).is_some()) || mesh::is_control(&pt)
+                    } else {
+                        true
+                    }
+                }
+                Err(_) => false,
+            }
+        }))
+    } else {
+        None
+    };
+
     // The carrier is chosen by config; everything downstream only sees the
     // `Transport` abstraction, so the UDP and TCP paths share one implementation.
     let wire_len = if cfg.transport.is_tcp() {
@@ -268,7 +326,7 @@ async fn run(cfg: ServerConfig) -> Result<()> {
         max_datagram_size(cfg.cipher) + obfs::MAX_HEADER
     };
     let transport = if cfg.transport.is_tcp() {
-        Transport::tcp_server(listen_addr, wire_len).await
+        Transport::tcp_server(listen_addr, wire_len, validator).await
     } else {
         shadowvpn::net::bind_udp(listen_addr).map(Transport::udp)
     }
@@ -316,18 +374,6 @@ async fn run(cfg: ServerConfig) -> Result<()> {
             lease_ttl: cfg.lease_ttl,
         }))
     }));
-
-    // Carrier obfuscation, matching the client. When enabled, datagrams on the
-    // wire look like QUIC/HTTP3 short-header packets; `None` is the plain
-    // `salt ++ AEAD` envelope.
-    let obfuscator: Option<Arc<Obfuscator>> = cfg
-        .obfs
-        .as_deref()
-        .and_then(Obfuscator::from_name)
-        .map(Arc::new);
-    if let Some(name) = cfg.obfs.as_deref() {
-        info!("  obfuscation    : {name} datagram shaping ENABLED");
-    }
 
     let nat_enabled = cfg.nat;
     let lease_ttl = cfg.lease_ttl;
