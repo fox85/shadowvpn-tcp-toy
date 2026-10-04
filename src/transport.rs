@@ -865,9 +865,10 @@ impl TcpHub {
                         if let Err(e) = crate::net::configure_tcp_stream(&stream) {
                             debug!("could not tune accepted TCP stream from {peer}: {e}");
                         }
-                        // Duplicate the fd *before* splitting: `setsockopt` and
-                        // `shutdown` on a duplicate still act on the socket, and
-                        // this keeps a handle we can reach from the hub later.
+                        // Duplicate the fd *before* splitting: `setsockopt`
+                        // acts on the socket rather than on the descriptor, so a
+                        // duplicate is enough to arm `SO_LINGER` later, and
+                        // closing it is what drops this reference to the socket.
                         #[cfg(unix)]
                         let dup_fd = {
                             use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -893,9 +894,13 @@ impl TcpHub {
                         let hub3 = Arc::clone(&hub2);
                         let inbound_tx = tx.clone();
                         let read_abort = Arc::clone(&abort);
-                        // Cloned before the spawn so the task owns it outright
-                        // (`hub2` has to stay with the accept loop).
+                        // Copied out *before* the spawn: the closure is `move`,
+                        // so reaching for `hub2` inside it would move the whole
+                        // Arc out of the accept loop, which needs it again on
+                        // the next iteration. Everything is `Copy` or an owned
+                        // clone, so the task carries its own copies.
                         let conn_validator = hub2.validator.clone();
+                        let conn_plausible = hub2.plausible;
                         tokio::spawn(async move {
                             if let Err(e) = tcp_read_loop(
                                 reader,
@@ -904,7 +909,7 @@ impl TcpHub {
                                 buf_len,
                                 read_abort,
                                 conn_validator,
-                                hub2.plausible,
+                                conn_plausible,
                             )
                             .await
                             {
