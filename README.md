@@ -193,6 +193,35 @@ release workflow repeats them per target.
 `armv7` is deliberately left on default features: 32-bit ARM crypto support is
 far less uniform.
 
+## Random padding (TCP only)
+
+Encryption hides *content*, not *length*. The handshake is the worst case: a
+keepalive, an assignment request and a DNS lookup each have a distinctive fixed
+size, so a passive observer sees the same few frame sizes at the same points in
+every session — a fingerprint even though the contents are encrypted.
+
+Random padding smears each frame's size across a range:
+
+```json
+{ "transport": "tcp", "padding": 64 }
+```
+
+```bash
+shadowvpn-server -l 0.0.0.0:8388 -t tcp --padding 64 ...
+shadowvpn-client -s host:8388 -t tcp --padding 64 ...
+```
+
+Default `64`; `0` disables it. Ignored on UDP, which has no frame layout to pad.
+Cost is a few percent of bandwidth, since the length is drawn from `0..=N`.
+
+Both the length **and** the contents are random: a fixed length would defeat the
+purpose, and fixed contents could simply be stripped by anyone who noticed.
+
+> Enabling padding changes the frame layout, so **both ends must agree** —
+> exactly as they must on `transport` and `cipher`. They may differ on the
+> bound, which is read per frame. This is obfuscation, not security: it adds
+> nothing cryptographically, it only removes the length side channel.
+
 ## Anti-probing: force-reset on non-conforming frames
 
 With `"transport": "tcp"`, a server that receives a frame that is not valid

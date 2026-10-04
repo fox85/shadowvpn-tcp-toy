@@ -40,6 +40,7 @@ use crate::mesh::{
 use crate::policy::{Mode, PolicyConfig};
 use crate::pool::host_range;
 use crate::protocol::{DEFAULT_TUN_MTU, DEFAULT_TUN_MTU_TCP};
+use crate::transport::{DEFAULT_PADDING_MAX, MAX_PADDING};
 use crate::state::default_client_state_path;
 
 /// Default cipher used when none is specified.
@@ -247,6 +248,11 @@ pub struct FileConfig {
     /// server learns as many endpoints as the client opens.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subflows: Option<usize>,
+
+    /// Upper bound on the random padding appended to each TCP frame, in bytes
+    /// (0 disables). Must match the other end.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub padding: Option<usize>,
 
     /// Carrier protocol: `"udp"` (default) or `"tcp"`. Must match the other end.
     ///
@@ -463,6 +469,9 @@ pub struct ServerConfig {
     pub listen: String,
     /// Carrier protocol: UDP (datagram) or TCP (stream, length-prefixed).
     pub transport: TransportKind,
+    /// Upper bound on random per-frame padding on the TCP carrier (0 disables).
+    /// Must match the client: enabling it changes the frame layout.
+    pub padding: usize,
     /// Negotiated AEAD cipher (`Cipher::None` disables encryption).
     pub cipher: Cipher,
     /// `EVP_BytesToKey`-derived master key (length == `cipher.key_len()`).
@@ -502,6 +511,9 @@ pub struct ClientConfig {
     /// Parallel TCP connections to open when `transport` is TCP. Always 1 on
     /// UDP (no connections) and in server NAT mode (clients keyed by endpoint).
     pub subflows: usize,
+    /// Upper bound on random per-frame padding on the TCP carrier (0 disables).
+    /// Ignored on UDP.
+    pub padding: usize,
     /// Negotiated AEAD cipher (`Cipher::None` disables encryption).
     pub cipher: Cipher,
     /// `EVP_BytesToKey`-derived master key (length == `cipher.key_len()`).
@@ -561,6 +573,11 @@ pub struct ServerArgs {
     /// Carrier protocol: udp | tcp. Must match the client.
     #[arg(short = 't', long = "transport", value_name = "udp|tcp")]
     pub transport: Option<String>,
+
+    /// Upper bound on random per-frame padding on the TCP carrier (0 disables).
+    /// Must match the client: enabling it changes the frame layout.
+    #[arg(long = "padding")]
+    pub padding: Option<usize>,
 
     /// Explicit TUN interface name.
     #[arg(long = "tun-name")]
@@ -659,6 +676,11 @@ pub struct ClientArgs {
     /// high-bandwidth-delay-product paths.
     #[arg(long = "subflows", value_name = "N")]
     pub subflows: Option<usize>,
+
+    /// Upper bound on random padding appended to each TCP frame, in bytes
+    /// (default DEFAULT_PADDING_MAX, 0 disables). Must match the other end.
+    #[arg(long = "padding", value_name = "N")]
+    pub padding: Option<usize>,
 
     /// Explicit TUN interface name.
     #[arg(long = "tun-name")]
@@ -787,6 +809,25 @@ fn resolve_subflows(subflows: Option<usize>, transport: TransportKind) -> Result
         n if n > MAX_SUBFLOWS => Err(ConfigError::Invalid {
             field: "subflows",
             message: format!("must be at most {MAX_SUBFLOWS}, got {n}"),
+        }),
+        n => Ok(n),
+    }
+}
+
+/// Resolve the upper bound on random per-frame TCP padding.
+///
+/// 0 disables padding entirely, which is also what UDP gets (there is no frame
+/// layout to pad there). Otherwise the value is capped at [`MAX_PADDING`] —
+/// the `pad_len` field is a single `u8`, so a larger bound could not be
+/// expressed on the wire.
+fn resolve_padding(padding: Option<usize>, transport: TransportKind) -> Result<usize, ConfigError> {
+    if !transport.is_tcp() {
+        return Ok(0);
+    }
+    match padding.unwrap_or(DEFAULT_PADDING_MAX) {
+        n if n > MAX_PADDING => Err(ConfigError::Invalid {
+            field: "padding",
+            message: format!("must be at most {MAX_PADDING}, got {n}"),
         }),
         n => Ok(n),
     }
@@ -1222,6 +1263,7 @@ impl ServerArgs {
             .ok_or(ConfigError::Missing("listen"))?;
 
         let transport = resolve_transport(self.transport.or(file.transport))?;
+        let padding = resolve_padding(self.padding.or(file.padding), transport)?;
 
         let (cipher, master_key) =
             resolve_crypto(self.cipher.or(file.cipher), self.password.or(file.password))?;
@@ -1299,6 +1341,7 @@ impl ServerArgs {
         Ok(ServerConfig {
             listen,
             transport,
+            padding,
             cipher,
             master_key,
             tun,
@@ -1332,6 +1375,7 @@ impl ClientArgs {
 
         let transport = resolve_transport(self.transport.or(file.transport))?;
         let subflows = resolve_subflows(self.subflows.or(file.subflows), transport)?;
+        let padding = resolve_padding(self.padding.or(file.padding), transport)?;
 
         let (cipher, master_key) =
             resolve_crypto(self.cipher.or(file.cipher), self.password.or(file.password))?;
@@ -1381,6 +1425,7 @@ impl ClientArgs {
             server,
             transport,
             subflows,
+            padding,
             cipher,
             master_key,
             tun,
@@ -1492,6 +1537,7 @@ mod tests {
                 password: None,
                 cipher: None,
                 transport: None,
+                padding: None,
                 tun_name: None,
                 tun_ip: None,
                 tun_netmask: None,
@@ -1532,6 +1578,7 @@ mod tests {
                 cipher: None,
                 transport: None,
                 subflows: None,
+                padding: None,
                 tun_name: None,
                 tun_ip: None,
                 tun_netmask: None,
@@ -1570,6 +1617,7 @@ mod tests {
             password: Some("test".to_string()),
             cipher: Some("aes-128-gcm".to_string()),
             transport: None,
+            padding: None,
             tun_name: Some("utun9".to_string()),
             tun_ip: Some(Ipv4Addr::new(10, 9, 0, 1)),
             tun_netmask: None,
@@ -1635,6 +1683,85 @@ mod tests {
             }
         };
         assert_eq!(explicit.resolve().unwrap().tun.mtu, 1300);
+    }
+
+    #[test]
+    fn padding_defaults_on_tcp_and_is_off_on_udp() {
+        // Padding reshapes the frame, so it only applies to the TCP carrier —
+        // and a UDP config asking for it must not silently change the datagram.
+        let base = || ClientArgs {
+            config: None,
+            server: Some("host:1".to_string()),
+            password: Some("pw".to_string()),
+            tun_ip: Some(Ipv4Addr::new(10, 0, 0, 2)),
+            peer_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            ..ClientArgs::empty()
+        };
+
+        assert_eq!(
+            ClientArgs {
+                transport: Some("tcp".to_string()),
+                ..base()
+            }
+            .resolve()
+            .unwrap()
+            .padding,
+            DEFAULT_PADDING_MAX
+        );
+        assert_eq!(
+            ClientArgs {
+                transport: Some("udp".to_string()),
+                ..base()
+            }
+            .resolve()
+            .unwrap()
+            .padding,
+            0
+        );
+
+        // An explicit value wins on TCP, and 0 disables it.
+        assert_eq!(
+            ClientArgs {
+                transport: Some("tcp".to_string()),
+                padding: Some(200),
+                ..base()
+            }
+            .resolve()
+            .unwrap()
+            .padding,
+            200
+        );
+        assert_eq!(
+            ClientArgs {
+                transport: Some("tcp".to_string()),
+                padding: Some(0),
+                ..base()
+            }
+            .resolve()
+            .unwrap()
+            .padding,
+            0
+        );
+    }
+
+    #[test]
+    fn padding_beyond_the_u8_field_is_rejected() {
+        // The pad length is written as a single u8; anything larger cannot be
+        // represented and must be a config error, not a silent clamp.
+        let args = ClientArgs {
+            config: None,
+            server: Some("host:1".to_string()),
+            password: Some("pw".to_string()),
+            transport: Some("tcp".to_string()),
+            padding: Some(MAX_PADDING + 1),
+            tun_ip: Some(Ipv4Addr::new(10, 0, 0, 2)),
+            peer_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            ..ClientArgs::empty()
+        };
+        assert!(matches!(
+            args.resolve(),
+            Err(ConfigError::Invalid { field: "padding", .. })
+        ));
     }
 
     #[test]
@@ -1934,6 +2061,7 @@ mod tests {
             password: Some("pw".to_string()),
             cipher: None,
             transport: None,
+            padding: None,
             tun_name: None,
             tun_ip: Some(Ipv4Addr::new(10, 9, 0, 1)),
             tun_netmask: None,
@@ -2020,6 +2148,7 @@ mod tests {
             password: Some("pw".to_string()),
             cipher: None,
             transport: None,
+            padding: None,
             tun_name: None,
             tun_ip: Some(Ipv4Addr::new(10, 77, 0, 1)),
             tun_netmask: None,

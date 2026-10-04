@@ -45,9 +45,9 @@ use shadowvpn::crypto::{decrypt_packet, encrypt_packet, Cipher};
 use shadowvpn::magic::{apply_push, PeerTable};
 use shadowvpn::mesh::{self, Assign, AssignStatus, RouteInstaller};
 use shadowvpn::obfs::{self, Obfuscator};
-use shadowvpn::protocol::{max_datagram_size, max_tcp_frame_size, MAX_IP_PACKET};
+use shadowvpn::protocol::{max_datagram_size, max_tcp_frame_size, max_tcp_wire_size, MAX_IP_PACKET};
 use shadowvpn::state::{default_client_state_path, write_private};
-use shadowvpn::transport::Transport;
+use shadowvpn::transport::{Transport, MAX_TCP_FRAME};
 use shadowvpn::tun_device::{SubnetRouteGuard, TunDevice};
 
 /// Depth of the hand-off channel between each relay loop's I/O reader and its
@@ -175,7 +175,20 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
     let transport = if cfg.transport.is_tcp() {
         drop(udp_socket); // unused on the TCP path
         info!("opening {subflows} parallel TCP subflow(s) to the server");
-        Transport::tcp_client(server_addr, subflows).await
+        Transport::tcp_client(
+            server_addr,
+            subflows,
+            shadowvpn::transport::TcpOptions {
+                // Sized for the padded frame: the transport strips framing
+                // before handing bytes up, but its own read buffer must hold
+                // the whole on-wire frame.
+                buf_len: max_tcp_wire_size(cfg.cipher, cfg.padding) + obfs::MAX_HEADER,
+                validator: None,
+                plausible: MAX_TCP_FRAME, // we trust the server we dialled
+                padding: cfg.padding,
+            },
+        )
+        .await
     } else {
         udp_socket.connect(server_addr).await?;
         Ok(Transport::udp(udp_socket))

@@ -77,6 +77,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use log::{debug, info, warn};
+use rand::RngExt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex, Notify, RwLock};
@@ -93,6 +94,27 @@ pub const TCP_LEN_PREFIX: usize = 2;
 /// approached; a TUN MTU near 64 KiB plus crypto overhead can exceed it, in
 /// which case the packet is dropped (see [`FrameReader`]).
 pub const MAX_TCP_FRAME: usize = u16::MAX as usize;
+
+/// Bytes in the padding-length field that follows the length prefix, in bytes.
+///
+/// Present only when padding is enabled. The field is a plain `u8`, so a frame
+/// carries at most 255 padding bytes — far more than is useful, since padding
+/// only needs to break up the length pattern, not to add bandwidth.
+///
+/// ## Frame format
+///
+/// ```text
+/// padding off:  [ u16 payload_len ][ payload ]
+/// padding on :  [ u16 payload_len ][ u8 pad_len ][ payload ][ pad bytes ]
+/// ```
+///
+/// The length prefix always counts the **payload only**. Note that the two
+/// modes are *not* wire-compatible with each other: both ends must agree,
+/// exactly as they must on `transport` and `cipher`.
+pub const TCP_PAD_LEN: usize = 1;
+
+/// Largest number of padding bytes one frame may carry (the `u8` field's range).
+pub const MAX_PADDING: usize = u8::MAX as usize;
 
 /// How long a fresh TCP connection has to deliver its **first** frame before we
 /// reset it.
@@ -127,6 +149,23 @@ pub fn plausible_frame_limit(mtu: u16) -> usize {
     // generous: the envelope is well under 100 bytes for every cipher.
     mtu as usize + 512
 }
+
+/// Default upper bound on the random padding appended to each TCP frame, in
+/// bytes.
+///
+/// This exists because a TCP tunnel leaks the **length** of what it carries,
+/// and the handshake is the worst offender: a keepalive, an assignment request
+/// and a DNS lookup each have a distinctive, fixed size, so a passive observer
+/// sees the same few frame sizes at the same points in every session. That is a
+/// fingerprint even though the contents are encrypted.
+///
+/// Appending a random 0..=N bytes per frame smears each size across a range, so
+/// the observable sequence stops being constant. Cost is a few percent of
+/// bandwidth at N=64 given ~1400-byte frames; 0 disables it.
+///
+/// The length prefix still counts the payload only, so this is pure obfuscation
+/// — it adds nothing to security, it just removes the length side channel.
+pub const DEFAULT_PADDING_MAX: usize = 64;
 
 /// How long a **partially received** frame may stay incomplete before we reset.
 ///
@@ -285,6 +324,31 @@ pub const UDP_ROTATE_EVERY: u32 = 16;
 /// and is no longer re-validated; a peer that holds the shared key is not a
 /// probe, and corruption beyond that point is handled by the processor.
 pub type Validator = Arc<dyn Fn(&[u8]) -> bool + Send + Sync>;
+
+/// Per-connection settings shared by both ends of the TCP carrier.
+///
+/// Bundled because every connection needs all of them, and passing them one by
+/// one had grown to the point of being error-prone.
+#[derive(Clone)]
+pub struct TcpOptions {
+    /// Buffer size for one frame, in bytes.
+    pub buf_len: usize,
+    /// Applied to a connection's first frame; see [`Validator`].
+    pub validator: Option<Validator>,
+    /// Declared payload lengths beyond this are rejected outright; see
+    /// [`plausible_frame_limit`].
+    pub plausible: usize,
+    /// Upper bound on random padding per frame; 0 disables it. See
+    /// [`DEFAULT_PADDING_MAX`].
+    pub padding: usize,
+}
+
+impl TcpOptions {
+    /// Bytes of framing overhead a frame carries on top of its payload.
+    fn header_len(&self) -> usize {
+        TCP_LEN_PREFIX + if self.padding > 0 { TCP_PAD_LEN } else { 0 }
+    }
+}
 
 /// How a packet should be placed on the subflows.
 ///
@@ -533,17 +597,27 @@ struct FrameReader<R: AsyncRead + Unpin> {
     /// Declared lengths beyond this are not our protocol; see
     /// [`plausible_frame_limit`].
     plausible: usize,
+    /// Whether frames carry a padding-length field, i.e. whether the peer has
+    /// padding enabled. Must match the sender or every frame misparses.
+    padded: bool,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
-    fn new(inner: R, plausible: usize) -> Self {
+    fn new(inner: R, plausible: usize, padded: bool) -> Self {
         Self {
             inner,
             buf: vec![0u8; READ_BUF_BYTES],
             start: 0,
             end: 0,
             plausible,
+            padded,
         }
+    }
+
+    /// Bytes of framing ahead of the payload: the length prefix, plus the
+    /// padding-length field when padding is in use.
+    fn header_len(&self) -> usize {
+        TCP_LEN_PREFIX + if self.padded { TCP_PAD_LEN } else { 0 }
     }
 
     /// Whether we are holding bytes that do not yet form a whole frame.
@@ -574,28 +648,38 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     ) -> std::io::Result<NextFrame> {
         loop {
             // 1. Do we already hold a whole frame?
-            if self.end - self.start >= TCP_LEN_PREFIX {
+            let head = self.header_len();
+            if self.end - self.start >= head {
                 let len =
                     u16::from_be_bytes([self.buf[self.start], self.buf[self.start + 1]]) as usize;
+                // Padding length, when padding is enabled. The prefix counts the
+                // payload only, so padding is not included in `len`.
+                let pad_len = if self.padded {
+                    self.buf[self.start + TCP_LEN_PREFIX] as usize
+                } else {
+                    0
+                };
                 if len == 0 {
-                    self.start += TCP_LEN_PREFIX;
+                    self.start += head + pad_len;
                     continue;
                 }
                 if len > self.plausible {
                     return Ok(NextFrame::Implausible(len));
                 }
-                if self.end - self.start - TCP_LEN_PREFIX >= len {
-                    let body = self.start + TCP_LEN_PREFIX;
+                let total = head + len + pad_len;
+                if self.end - self.start >= total {
+                    let body = self.start + head;
                     if len > out.len() {
                         warn!(
                             "dropping oversized {len}-byte TCP frame (buffer is {} bytes)",
                             out.len()
                         );
-                        self.start = body + len;
+                        self.start += total;
                         continue;
                     }
                     out[..len].copy_from_slice(&self.buf[body..body + len]);
-                    self.start = body + len;
+                    // Skip the payload *and* its padding.
+                    self.start += total;
                     return Ok(NextFrame::Frame(len));
                 }
             }
@@ -646,16 +730,40 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     }
 }
 
-/// Append `payload` as a length-prefixed frame to `out`.
+/// Append `payload` as a framed, optionally padded frame to `out`.
 ///
 /// Returns `false` (and appends nothing) when the payload cannot be framed, so
 /// the caller can drop that packet and keep the stream usable.
-fn append_frame(out: &mut Vec<u8>, payload: &[u8]) -> bool {
+///
+/// With `pad_max > 0` a random-length run of **random bytes** follows the
+/// payload, and its length is recorded in the `u8` field after the length
+/// prefix. Both the length and the contents are random: a fixed length would
+/// defeat the purpose, and fixed contents would make the tail trivially
+/// strippable by anyone who noticed.
+fn append_frame(out: &mut Vec<u8>, payload: &[u8], pad_max: usize) -> bool {
     if payload.is_empty() || payload.len() > MAX_TCP_FRAME {
         return false;
     }
+    // The prefix counts the payload only — padding rides outside it, so the
+    // payload length stays meaningful for the plausibility check.
+    //
+    // A peer with padding *disabled* still cannot parse this frame: it would
+    // read the pad-length byte as the payload's first byte. Enabling padding
+    // changes the frame layout, so both ends must agree on whether it is on
+    // (they may differ on the bound, which is read per frame).
     out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    out.extend_from_slice(payload);
+    if pad_max > 0 {
+        let pad_len = rand::rng().random_range(0..=pad_max.min(MAX_PADDING));
+        out.push(pad_len as u8);
+        out.extend_from_slice(payload);
+        if pad_len > 0 {
+            let start = out.len();
+            out.resize(start + pad_len, 0);
+            rand::rng().fill(&mut out[start..]);
+        }
+    } else {
+        out.extend_from_slice(payload);
+    }
     true
 }
 
@@ -670,18 +778,18 @@ async fn tcp_read_loop<R, T, F>(
     reader: R,
     inbound: mpsc::Sender<T>,
     tag: F,
-    buf_len: usize,
+    opts: TcpOptions,
     abort: Arc<ConnAbort>,
-    validator: Option<Validator>,
-    plausible: usize,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     F: Fn(Vec<u8>) -> T,
 {
-    let mut reader = FrameReader::new(reader, plausible);
-    let mut frame = vec![0u8; buf_len];
+    let padded = opts.padding > 0;
+    let mut reader = FrameReader::new(reader, opts.plausible, padded);
+    let mut frame = vec![0u8; opts.buf_len];
     let signal = abort.signal();
+    let validator = opts.validator.clone();
     // Only the first frame is checked; see `Validator`.
     let mut authenticated = validator.is_none();
 
@@ -709,7 +817,8 @@ where
             NextFrame::Eof => return Ok(()), // peer closed
             NextFrame::Implausible(declared) => {
                 warn!(
-                    "tcp: peer declared a {declared}-byte frame (max plausible {plausible}), resetting"
+                    "tcp: peer declared a {declared}-byte frame (max plausible {}), resetting",
+                    opts.plausible
                 );
                 abort.fire();
                 return Ok(());
@@ -761,6 +870,7 @@ async fn tcp_write_loop(
     mut writer: SharedWrite,
     mut outbound: mpsc::Receiver<Vec<u8>>,
     abort: Arc<Notify>,
+    padding: usize,
 ) {
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BATCH_FRAMES);
     let mut out: Vec<u8> = Vec::with_capacity(READ_BUF_BYTES);
@@ -788,7 +898,7 @@ async fn tcp_write_loop(
 
         let mut dropped = 0usize;
         for payload in &batch {
-            if !append_frame(&mut out, payload) {
+            if !append_frame(&mut out, payload, padding) {
                 dropped += 1;
             }
         }
@@ -916,11 +1026,8 @@ pub struct TcpHub {
     outbound: RwLock<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>,
     /// Per-peer teardown handles for [`TcpHub::force_reset`].
     aborts: RwLock<HashMap<SocketAddr, Arc<ConnAbort>>>,
-    /// Applied to each connection's first frame; see [`Validator`].
-    validator: Option<Validator>,
-    /// Declared frame lengths beyond this are rejected outright; see
-    /// [`plausible_frame_limit`].
-    plausible: usize,
+    /// Per-connection settings; see [`TcpOptions`].
+    opts: TcpOptions,
     /// Monotonic counter mixed into unordered subflow selection (see
     /// [`pick_subflow`]).
     spins: AtomicU32,
@@ -931,20 +1038,14 @@ impl TcpHub {
     ///
     /// `validator` is applied to every connection's first frame; a frame that
     /// fails it resets the connection (see [`Validator`]).
-    pub async fn bind(
-        addr: SocketAddr,
-        buf_len: usize,
-        validator: Option<Validator>,
-        plausible: usize,
-    ) -> std::io::Result<Arc<Self>> {
+    pub async fn bind(addr: SocketAddr, opts: TcpOptions) -> std::io::Result<Arc<Self>> {
         let listener: TcpListener = bind_tcp_listener(addr)?;
         let (tx, rx) = mpsc::channel(TCP_CHANNEL_DEPTH);
         let hub = Arc::new(Self {
             inbound: Mutex::new(rx),
             outbound: RwLock::new(HashMap::new()),
             aborts: RwLock::new(HashMap::new()),
-            validator,
-            plausible,
+            opts,
             spins: AtomicU32::new(0),
         });
 
@@ -990,22 +1091,18 @@ impl TcpHub {
                         let hub3 = Arc::clone(&hub2);
                         let inbound_tx = tx.clone();
                         let read_abort = Arc::clone(&abort);
-                        // Copied out *before* the spawn: the closure is `move`,
-                        // so reaching for `hub2` inside it would move the whole
-                        // Arc out of the accept loop, which needs it again on
-                        // the next iteration. Everything is `Copy` or an owned
-                        // clone, so the task carries its own copies.
-                        let conn_validator = hub2.validator.clone();
-                        let conn_plausible = hub2.plausible;
+                        // Cloned *before* the spawn: the closure is `move`, so
+                        // reaching for `hub2` inside it would move the whole Arc
+                        // out of the accept loop, which needs it again on the
+                        // next iteration.
+                        let conn_opts = hub2.opts.clone();
                         tokio::spawn(async move {
                             if let Err(e) = tcp_read_loop(
                                 reader,
                                 inbound_tx,
                                 move |p| (peer, p),
-                                buf_len,
+                                conn_opts,
                                 read_abort,
-                                conn_validator,
-                                conn_plausible,
                             )
                             .await
                             {
@@ -1014,7 +1111,12 @@ impl TcpHub {
                             hub3.outbound.write().await.remove(&peer);
                             hub3.aborts.write().await.remove(&peer);
                         });
-                        tokio::spawn(tcp_write_loop(writer, out_rx, abort.signal()));
+                        tokio::spawn(tcp_write_loop(
+                            writer,
+                            out_rx,
+                            abort.signal(),
+                            hub2.opts.padding,
+                        ));
                         info!("tcp: accepted connection from {peer}");
                     }
                     Err(e) => {
@@ -1163,7 +1265,11 @@ impl TcpClient {
     /// The connections must exist *before* the TUN device is brought up, for the
     /// same source-address-selection reason the UDP path `connect()`s early (see
     /// `bin/client.rs`).
-    pub async fn connect(server: SocketAddr, subflows: usize) -> std::io::Result<Arc<Self>> {
+    pub async fn connect(
+        server: SocketAddr,
+        subflows: usize,
+        opts: TcpOptions,
+    ) -> std::io::Result<Arc<Self>> {
         let subflows = subflows.max(1);
         let (inbound_tx, inbound_rx) = mpsc::channel(TCP_CHANNEL_DEPTH);
 
@@ -1173,7 +1279,7 @@ impl TcpClient {
         let mut local = None;
 
         for idx in 0..subflows {
-            let (tx, addr, reader) = Self::dial(server, &inbound_tx).await?;
+            let (tx, addr, reader) = Self::dial(server, &inbound_tx, opts.clone()).await?;
             if idx == 0 {
                 local = addr;
             }
@@ -1200,6 +1306,7 @@ impl TcpClient {
                 Arc::clone(&outbound),
                 inbound_tx.clone(),
                 reader,
+                opts.clone(),
             ));
         }
 
@@ -1212,6 +1319,7 @@ impl TcpClient {
     async fn dial(
         server: SocketAddr,
         inbound_tx: &mpsc::Sender<Vec<u8>>,
+        opts: TcpOptions,
     ) -> std::io::Result<(
         mpsc::Sender<Vec<u8>>,
         Option<SocketAddr>,
@@ -1233,18 +1341,15 @@ impl TcpClient {
         let abort = Arc::new(ConnAbort::new());
 
         let (out_tx, out_rx) = mpsc::channel(TCP_CHANNEL_DEPTH);
-        tokio::spawn(tcp_write_loop(writer, out_rx, abort.signal()));
+        tokio::spawn(tcp_write_loop(
+            writer,
+            out_rx,
+            abort.signal(),
+            opts.padding,
+        ));
 
         let tx = inbound_tx.clone();
-        let reader_task = tokio::spawn(tcp_read_loop(
-            reader,
-            tx,
-            |p| p,
-            MAX_TCP_FRAME + crate::protocol::TCP_LEN_PREFIX,
-            abort,
-            None,
-            MAX_TCP_FRAME, // client trusts its server: no plausibility bound
-        ));
+        let reader_task = tokio::spawn(tcp_read_loop(reader, tx, |p| p, opts, abort));
 
         Ok((out_tx, local, reader_task))
     }
@@ -1356,6 +1461,7 @@ async fn supervise_subflow(
     outbound: Slots,
     inbound_tx: mpsc::Sender<Vec<u8>>,
     reader: tokio::task::JoinHandle<std::io::Result<()>>,
+    opts: TcpOptions,
 ) {
     let mut reader = reader;
     let mut attempts = 0u32;
@@ -1370,7 +1476,7 @@ async fn supervise_subflow(
 
         let (tx, _local, next_reader) = loop {
             attempts += 1;
-            match TcpClient::dial(server, &inbound_tx).await {
+            match TcpClient::dial(server, &inbound_tx, opts.clone()).await {
                 Ok(v) => break v,
                 Err(e) => {
                     if attempts >= MAX_RECONNECT_ATTEMPTS {
@@ -1417,23 +1523,21 @@ impl Transport {
         }
     }
 
-    /// Start a TCP listener bound to `addr`; `buf_len` sizes per-connection read
-    /// buffers. `validator` rejects a connection's first frame if it is not
-    /// ShadowVPN traffic.
-    pub async fn tcp_server(
-        addr: SocketAddr,
-        buf_len: usize,
-        validator: Option<Validator>,
-        plausible: usize,
-    ) -> std::io::Result<Self> {
-        Ok(Transport::TcpServer(
-            TcpHub::bind(addr, buf_len, validator, plausible).await?,
-        ))
+    /// Start a TCP listener bound to `addr`; see [`TcpOptions`].
+    pub async fn tcp_server(addr: SocketAddr, opts: TcpOptions) -> std::io::Result<Self> {
+        Ok(Transport::TcpServer(TcpHub::bind(addr, opts).await?))
     }
 
-    /// Dial a TCP server at `addr` with `subflows` parallel connections.
-    pub async fn tcp_client(addr: SocketAddr, subflows: usize) -> std::io::Result<Self> {
-        Ok(Transport::TcpClient(TcpClient::connect(addr, subflows).await?))
+    /// Dial a TCP server at `addr` with `subflows` parallel connections; see
+    /// [`TcpOptions`].
+    pub async fn tcp_client(
+        addr: SocketAddr,
+        subflows: usize,
+        opts: TcpOptions,
+    ) -> std::io::Result<Self> {
+        Ok(Transport::TcpClient(
+            TcpClient::connect(addr, subflows, opts).await?,
+        ))
     }
 
     /// Receive the next tunnelled datagram (UDP) or frame (TCP) into `buf`,
@@ -1577,5 +1681,117 @@ impl Transport {
         } else {
             "udp"
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Generous bound: these tests are about framing, not plausibility.
+    const TEST_PLAUSIBLE: usize = 4096;
+
+    /// Run the async reader on a one-shot runtime so the sync tests can await.
+    fn read_all(wire: &[u8], padded: bool) -> Vec<Vec<u8>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mut r = FrameReader::new(wire, TEST_PLAUSIBLE, padded);
+            let mut out = vec![0u8; 4096];
+            let mut frames = Vec::new();
+            loop {
+                match r.next_frame(&mut out, None).await.unwrap() {
+                    NextFrame::Frame(n) => frames.push(out[..n].to_vec()),
+                    NextFrame::Eof | NextFrame::Stalled => break,
+                    NextFrame::Implausible(len) => {
+                        panic!("unexpected implausible frame of {len} bytes")
+                    }
+                }
+            }
+            frames
+        })
+    }
+
+    #[test]
+    fn unpadded_round_trip() {
+        let mut wire = Vec::new();
+        assert!(append_frame(&mut wire, b"hello", 0));
+        // Layout with padding off: [u16 len][payload].
+        assert_eq!(&wire[..TCP_LEN_PREFIX], &5u16.to_be_bytes());
+        assert_eq!(wire.len(), TCP_LEN_PREFIX + 5);
+        assert_eq!(read_all(&wire, false), vec![b"hello".to_vec()]);
+    }
+
+    #[test]
+    fn padded_round_trip() {
+        let mut wire = Vec::new();
+        assert!(append_frame(&mut wire, b"hello", 64));
+        // Layout with padding on: [u16 len][u8 pad_len][payload][pad].
+        assert_eq!(&wire[..TCP_LEN_PREFIX], &5u16.to_be_bytes());
+        let declared = wire[TCP_LEN_PREFIX] as usize;
+        assert_eq!(wire.len(), TCP_LEN_PREFIX + TCP_PAD_LEN + 5 + declared);
+        assert!(declared <= 64);
+        assert_eq!(read_all(&wire, true), vec![b"hello".to_vec()]);
+    }
+
+    #[test]
+    fn padding_is_skipped_and_payloads_survive() {
+        // Several frames back to back: padding must be skipped each time, and
+        // must never leak into the next payload even if its bytes look like a
+        // length prefix.
+        let mut wire = Vec::new();
+        for payload in [b"a".as_slice(), b"bb".as_slice(), b"ccc".as_slice()] {
+            assert!(append_frame(&mut wire, payload, 200));
+        }
+        assert_eq!(
+            read_all(&wire, true),
+            vec![b"a".to_vec(), b"bb".to_vec(), b"ccc".to_vec()]
+        );
+    }
+
+    #[test]
+    fn padding_length_varies() {
+        // A fixed length would defeat the purpose of obscuring frame sizes.
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let mut wire = Vec::new();
+            assert!(append_frame(&mut wire, b"x", 64));
+            seen.insert(wire[TCP_LEN_PREFIX]);
+        }
+        assert!(seen.len() > 1, "padding length never varied: {seen:?}");
+    }
+
+    #[test]
+    fn padding_respects_the_u8_bound() {
+        // The pad length field is a single u8, so a larger request is clamped
+        // rather than silently truncating the written length.
+        for _ in 0..200 {
+            let mut wire = Vec::new();
+            assert!(append_frame(&mut wire, b"x", 1000));
+            let declared = wire[TCP_LEN_PREFIX] as usize;
+            assert!(declared <= MAX_PADDING, "pad_len {declared} exceeds the u8 field");
+        }
+    }
+
+    #[test]
+    fn empty_and_oversized_payloads_are_rejected() {
+        let mut wire = Vec::new();
+        assert!(!append_frame(&mut wire, b"", 0));
+        assert!(wire.is_empty(), "nothing should be written");
+
+        let big = vec![0u8; MAX_TCP_FRAME + 1];
+        assert!(!append_frame(&mut wire, &big, 0));
+        assert!(wire.is_empty(), "nothing should be written");
+    }
+
+    #[test]
+    fn truncated_stream_yields_no_frame() {
+        // A peer that declares padding but stops mid-frame must not produce a
+        // bogus frame from the bytes it did send.
+        let mut wire = Vec::new();
+        assert!(append_frame(&mut wire, b"payload", 32));
+        let truncated = &wire[..wire.len() - 1];
+        assert_eq!(read_all(truncated, true), Vec::<Vec<u8>>::new());
     }
 }

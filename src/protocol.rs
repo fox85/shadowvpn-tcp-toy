@@ -88,6 +88,14 @@ pub fn crypto_overhead(cipher: Cipher) -> usize {
 /// why this constant only ever applies to the TCP carrier.
 pub const TCP_LEN_PREFIX: usize = 2;
 
+/// Re-exported from [`crate::transport::TCP_PAD_LEN`]: bytes in the optional
+/// padding-length field.
+pub const TCP_PAD_LEN: usize = crate::transport::TCP_PAD_LEN;
+
+/// Re-exported from [`crate::transport::MAX_PADDING`]: largest padding a frame
+/// may carry.
+pub const MAX_PADDING: usize = crate::transport::MAX_PADDING;
+
 /// Largest frame payload the TCP carrier can delimit, in bytes: the `u16`
 /// length prefix caps a frame at 65535 payload bytes.
 ///
@@ -104,6 +112,20 @@ pub const MAX_TCP_FRAME: usize = crate::transport::MAX_TCP_FRAME;
 /// socket buffer does have to hold it.
 pub fn max_tcp_frame_size(cipher: Cipher) -> usize {
     max_datagram_size(cipher) + TCP_LEN_PREFIX
+}
+
+/// The size, in bytes, of the largest on-wire TCP frame for `cipher` once
+/// random padding is included.
+///
+/// Buffers must be sized for the padded frame, not just the payload, or a
+/// maximally padded frame would be reported as oversized and dropped.
+pub fn max_tcp_wire_size(cipher: Cipher, pad_max: usize) -> usize {
+    max_tcp_frame_size(cipher)
+        + if pad_max > 0 {
+            TCP_PAD_LEN + pad_max
+        } else {
+            0
+        }
 }
 
 /// The size, in bytes, that a UDP receive buffer must have to hold the

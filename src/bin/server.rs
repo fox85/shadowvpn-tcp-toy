@@ -47,7 +47,7 @@ use shadowvpn::mesh::{
 use shadowvpn::nat::{Ingress, Nat};
 use shadowvpn::obfs::{self, Obfuscator};
 use shadowvpn::pool::host_range;
-use shadowvpn::protocol::{max_datagram_size, max_tcp_frame_size, MAX_IP_PACKET};
+use shadowvpn::protocol::{max_datagram_size, max_tcp_wire_size, MAX_IP_PACKET};
 use shadowvpn::transport::{FlowHint, Transport};
 use shadowvpn::tun_device::TunDevice;
 
@@ -320,17 +320,21 @@ async fn run(cfg: ServerConfig) -> Result<()> {
     // The carrier is chosen by config; everything downstream only sees the
     // `Transport` abstraction, so the UDP and TCP paths share one implementation.
     let wire_len = if cfg.transport.is_tcp() {
-        // A TCP frame carries the same datagram plus a 2-byte length prefix.
-        max_tcp_frame_size(cfg.cipher) + obfs::MAX_HEADER
+        // A TCP frame carries the same datagram plus framing, and (when
+        // padding is on) up to `cfg.padding` random bytes on top.
+        max_tcp_wire_size(cfg.cipher, cfg.padding) + obfs::MAX_HEADER
     } else {
         max_datagram_size(cfg.cipher) + obfs::MAX_HEADER
     };
     let transport = if cfg.transport.is_tcp() {
         Transport::tcp_server(
             listen_addr,
-            wire_len,
-            validator,
-            shadowvpn::transport::plausible_frame_limit(cfg.tun.mtu),
+            shadowvpn::transport::TcpOptions {
+                buf_len: wire_len,
+                validator,
+                plausible: shadowvpn::transport::plausible_frame_limit(cfg.tun.mtu),
+                padding: cfg.padding,
+            },
         )
         .await
     } else {
