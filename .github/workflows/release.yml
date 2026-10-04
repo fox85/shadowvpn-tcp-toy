@@ -25,9 +25,28 @@ jobs:
         include:
           # x64 / aarch64 / armv7, statically linked against musl so the archive
           # runs on any Linux (routers, old glibc, containers) with no runtime deps.
+          #
+          # `rustflags` enables the CPU features the AEAD ciphers need:
+          #
+          # * aarch64 — +aes,+neon. Without `+aes` the `aes` crate falls back to
+          #   a software table implementation, which is several times slower than
+          #   the ARMv8 crypto instructions; ChaCha20-Poly1305 benefits from
+          #   `+neon`. (Caveat: AES is an *optional* ARMv8-A extension. Verify
+          #   your devices have it — `grep -m1 aes /proc/cpuinfo` — or drop
+          #   `+aes` to stay portable.)
+          # * armv7 — left at the default. 32-bit ARM AES is rarer and the
+          #   target covers everything from a Pi 2 to a modern router; add
+          #   `-C target-feature=+aes,+neon` here only if every device you ship
+          #   to supports it.
+          # * x86_64 — nothing needed. The `aes` crate detects AES-NI at
+          #   *runtime* on x86, so a portable build still uses it when present.
+          #   (Use `-C target-cpu=native` for local builds on the target box.)
           - target: x86_64-unknown-linux-musl
+            rustflags: ""
           - target: aarch64-unknown-linux-musl
+            rustflags: "-C target-feature=+aes,+neon"
           - target: armv7-unknown-linux-musleabihf
+            rustflags: ""
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -50,19 +69,33 @@ jobs:
 
       - name: Build
         env:
-          RUSTFLAGS: -C strip=symbols
+          # NOTE: setting the RUSTFLAGS *env var* overrides any rustflags in
+          # .cargo/config.toml, so the per-target features must be listed here.
+          RUSTFLAGS: -C strip=symbols ${{ matrix.rustflags }}
         run: cross build --locked --release --target ${{ matrix.target }}
 
       - name: Package
         run: |
+          set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           [ "${version}" = "${GITHUB_REF_NAME}" ] && version="${GITHUB_SHA::7}"
           pkg="shadowvpn-${version}-${{ matrix.target }}"
           mkdir -p "${pkg}"
+
+          # Binaries are mandatory; docs are optional so a trimmed repo (or a
+          # fork without every top-level file) still produces an archive.
           for b in shadowvpn-server shadowvpn-client; do
-            cp "target/${{ matrix.target }}/release/${b}" "${pkg}/"
+            src="target/${{ matrix.target }}/release/${b}"
+            if [ ! -f "${src}" ]; then
+              echo "::error::missing build output ${src}"
+              exit 1
+            fi
+            cp "${src}" "${pkg}/"
           done
-          cp README.md LICENSE "${pkg}/"
+          for f in README.md LICENSE CHANGES.md docs/reference/configuration.md; do
+            [ -f "${f}" ] && cp "${f}" "${pkg}/" || echo "skipping optional file ${f}"
+          done
+
           tar -czf "${pkg}.tar.gz" "${pkg}"
           sha256sum "${pkg}.tar.gz" | tee "${pkg}.tar.gz.sha256"
           echo "PKG=${pkg}" >> "$GITHUB_ENV"
