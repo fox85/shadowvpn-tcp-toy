@@ -343,13 +343,6 @@ pub struct TcpOptions {
     pub padding: usize,
 }
 
-impl TcpOptions {
-    /// Bytes of framing overhead a frame carries on top of its payload.
-    fn header_len(&self) -> usize {
-        TCP_LEN_PREFIX + if self.padding > 0 { TCP_PAD_LEN } else { 0 }
-    }
-}
-
 /// How a packet should be placed on the subflows.
 ///
 /// Returned by [`classify`] and passed down to the send path, because **the
@@ -1163,16 +1156,6 @@ impl TcpHub {
             abort.fire();
             warn!("tcp: force-reset connection from {peer}: non-conforming frame");
         }
-    }
-
-    /// Queue `wire` for delivery to `peer`'s connection.
-    ///
-    /// A peer with no live connection (already gone, or never accepted) is not an
-    /// error — the packet is dropped, exactly as a UDP `send_to` to a stale
-    /// address would be.
-    async fn send_to(&self, wire: &[u8], peer: &SocketAddr) -> std::io::Result<()> {
-        self.queue(wire, std::slice::from_ref(peer), *peer, None)
-            .await
     }
 
     /// Queue `wire` on the best connection among `peers`, preferring
