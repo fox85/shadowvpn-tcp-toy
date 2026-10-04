@@ -209,9 +209,14 @@ packet and staying connected:
   connections are reset within [`STALLED_FRAME_TIMEOUT`]; a peer that sends
   nothing at all is reset within [`FIRST_FRAME_TIMEOUT`].
 
-The reset sets `SO_LINGER` with a zero timeout and shuts the connection down, so
-the peer gets a RST instead of an orderly FIN — a scanner cannot even complete
-a handshake, and cannot keep pushing bytes at an open socket.
+The reset arms `SO_LINGER` with a zero timeout and then closes the socket, so the
+peer gets a **RST** instead of an orderly FIN — a scanner cannot even complete a
+handshake, and cannot keep pushing bytes at an open socket.
+
+> `SO_LINGER` and `shutdown()` are mutually exclusive: `shutdown()` *is* the
+> orderly teardown and sends a FIN, after which `close()` has nothing left to
+> abort. Only the `SO_LINGER` arm is used, and the RST is emitted when the
+> socket's last file descriptor closes.
 
 This is safe against false positives: a frame that fails to authenticate is by
 construction not from a peer holding the shared key, so a correctly configured

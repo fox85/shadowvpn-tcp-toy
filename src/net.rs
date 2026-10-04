@@ -280,23 +280,27 @@ fn tune_socket(sock: &Socket) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Force `fd`'s connection to end abruptly, so a peer that sent a
-/// non-conforming frame gets nothing usable back.
+/// Arm `fd`'s socket so that closing it emits a TCP **RST** instead of FIN.
 ///
-/// Two steps, in this order:
+/// `SO_LINGER` with `l_onoff = 1, l_linger = 0` is the standard way to make
+/// `close()` abortive: the kernel discards any queued data and sends a reset.
 ///
-/// 1. `SO_LINGER` with a **zero** timeout makes the eventual `close()` send
-///    **RST** instead of FIN. Without it the connection lingers in FIN_WAIT
-///    and the peer sees an orderly close — which a scanner can still read as
-///    "a service is here".
-/// 2. `shutdown(SHUT_RDWR)` ends the connection *now* rather than waiting for
-///    the application to notice: a pending `read` returns EOF, so the reader
-///    task wakes up and drops the socket, which is what sends the RST.
+/// ## Do NOT call `shutdown()` here
 ///
-/// `fd` may be a duplicate of the socket's fd: `setsockopt` and `shutdown` act
-/// on the socket itself, not on the descriptor.
+/// This is the whole point of the previous version being wrong. `shutdown()` is
+/// the *orderly* teardown: it sends a **FIN** and moves the connection into
+/// FIN_WAIT. Once that has happened the connection is already being closed
+/// gracefully, and the subsequent `close()` — SO_LINGER or not — has nothing
+/// left to abort, so the peer observes a normal close rather than a reset.
+/// That is exactly the "it just closes the connection" symptom.
+///
+/// So this function only **arms** the option. The reset is emitted when the
+/// socket's last file descriptor is closed, which is the caller's job.
+///
+/// `fd` may be a duplicate: `setsockopt` acts on the socket, not on the
+/// descriptor.
 #[cfg(unix)]
-pub fn force_reset_fd(fd: std::os::fd::RawFd) {
+pub fn arm_tcp_reset(fd: std::os::fd::RawFd) {
     unsafe {
         let linger = libc::linger {
             l_onoff: 1,
@@ -312,12 +316,6 @@ pub fn force_reset_fd(fd: std::os::fd::RawFd) {
         {
             log::debug!(
                 "could not set SO_LINGER for force-reset: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        if libc::shutdown(fd, libc::SHUT_RDWR) != 0 {
-            log::debug!(
-                "could not shutdown socket for force-reset: {}",
                 std::io::Error::last_os_error()
             );
         }

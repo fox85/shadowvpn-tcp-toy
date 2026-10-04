@@ -446,6 +446,74 @@ nc -v <server>:8388 < /dev/null         # 静默连接，10s 内 reset
 服务端日志会出现 `tcp: peer did not produce a complete frame in time (partial
 frame stalled), resetting` 或 `tcp: first frame failed validation, resetting`。
 
+## 修正（第二轮）：发的是 FIN 不是 RST
+
+上一轮修好了"探测包首 2 字节被当长度前缀 → 卡在 read 上"的问题，超时与校验都能触发
+reset 了。但实测**发出的是正常关闭（FIN），不是强制重置（RST）**。
+
+### 根因：`shutdown()` 本身就是"优雅关闭"
+
+上一版的 `force_reset_fd()` 做了两步：
+
+```rust
+setsockopt(SO_LINGER, {l_onoff: 1, l_linger: 0});  // 让 close() 发 RST
+shutdown(fd, SHUT_RDWR);                            // ← 问题在这里
+```
+
+`shutdown()` 是**有序**关闭：它立刻发出 **FIN**，连接进入 FIN_WAIT。到这一步，连接
+已经在优雅关闭了，之后的 `close()`——无论有没有 SO_LINGER——都没有东西可以中止，
+于是对端观察到的是一次**正常关闭**。
+
+这正是"只是实现了 TCP 关闭连接"的全部原因。**SO_LINGER 和 shutdown 是互斥的两种
+语义，不能一起用。**
+
+### 修正
+
+1. **删掉 `shutdown()`**，函数改名 `arm_tcp_reset()`，只负责设 `SO_LINGER`。
+   RST 在 socket 最后一个 fd 被关闭时由内核发出——这才是正确的时序。
+
+2. **`ConnAbort::fire()` 关闭我们持有的 dup fd**
+   一个 socket 有多个 fd：`into_split()` 的两个半共享一个，加上我们 `dup()` 的那个。
+   只有**最后一个** fd 关闭才真正 close socket → 才发 RST。
+   所以 `fire()` 现在：设 SO_LINGER → `take()` 并 drop dup fd → notify 让两个循环
+   drop 各自的半 → 引用归零 → close → **RST**。
+   `fd` 改为 `Mutex<Option<OwnedFd>>` 以便 `take()`；加 `fired: AtomicBool` 防重复。
+
+3. **超长帧即时判定（`plausible_frame_limit`）**
+   除了等超时，现在还做**瞬时**判定：长度前缀声明超过合理上界即非法，立即 reset。
+   上界由 MTU 推导（`mtu + 512`），不是硬编码——MTU 大的隧道本来就会产生大帧，
+   写死一个值会误杀。客户端传 `MAX_TCP_FRAME`（等于不限制，它信任自己拨的服务端）。
+
+| 探测 | 首 2 字节 | 被解析的 len | MTU 1500 时上界 2012 | 结果 |
+| --- | --- | --- | --- | --- |
+| `curl` | `"GE"` | 18245 | 超出 | **立即 RST** |
+| TLS ClientHello | `0x16 0x03` | 5635 | 超出 | **立即 RST** |
+| SSH banner | `"SS"` | 21331 | 超出 | **立即 RST** |
+| 连上后不发数据 | — | — | — | 10s 内 RST |
+| 发了数据但凑不满一帧 | — | 合法长度 | 未超 | 3s 内 RST |
+
+### 覆盖的握手失败路径
+
+连接被 accept 后，以下任一情况都会 **RST**（不是 FIN）：
+
+1. 长度前缀声明超过合理上界 → 立即
+2. 首帧未通过校验（de-obfs → decrypt 失败；`cipher=none` 时形态检查失败）→ 立即
+3. 收到部分字节但帧迟迟不完整 → 3s（`STALLED_FRAME_TIMEOUT`）
+4. 连接后完全不发数据 → 10s（`FIRST_FRAME_TIMEOUT`）
+5. 已认证连接后续帧解包/认证失败（processor 路径）→ 立即
+
+### 如何确认发出的是 RST 而非 FIN
+
+```sh
+# 客户端侧抓包
+sudo tcpdump -i any -nn 'host <server-ip> and port 8388'
+# 另开终端
+curl -v http://<server-ip>:8388/
+```
+
+应看到服务端回 `Flags [R.]` 或 `[R]`（RST），**而不是** `[F.]`（FIN）。
+`curl` 侧报错应为 `Connection reset by peer`，而非 `Connection closed`。
+
 ## 编译时开启硬件 AES
 
 引用说明："To use AES-GCM at full speed on ARM, build with the crypto features

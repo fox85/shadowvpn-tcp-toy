@@ -326,7 +326,13 @@ async fn run(cfg: ServerConfig) -> Result<()> {
         max_datagram_size(cfg.cipher) + obfs::MAX_HEADER
     };
     let transport = if cfg.transport.is_tcp() {
-        Transport::tcp_server(listen_addr, wire_len, validator).await
+        Transport::tcp_server(
+            listen_addr,
+            wire_len,
+            validator,
+            shadowvpn::transport::plausible_frame_limit(cfg.tun.mtu),
+        )
+        .await
     } else {
         shadowvpn::net::bind_udp(listen_addr).map(Transport::udp)
     }

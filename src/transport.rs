@@ -70,8 +70,8 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -101,6 +101,31 @@ pub const MAX_TCP_FRAME: usize = u16::MAX as usize;
 /// of ours — typically a port scanner completing a handshake and then waiting.
 /// Resetting keeps the probe from holding a connection open indefinitely.
 pub const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Largest frame a peer may declare before we conclude it is not speaking our
+/// protocol, derived from the tunnel MTU.
+///
+/// The `u16` length prefix permits up to 65535, but a real frame is bounded by
+/// the tunnel MTU plus the crypto envelope and any obfs header. Anything well
+/// beyond that cannot have come from a ShadowVPN peer, and recognising it
+/// **immediately** — rather than waiting for bytes that will never arrive — is
+/// what turns a probe into an instant reset:
+///
+/// * `curl http://host:port/` starts with `"GE"`, which reads as **18245**;
+/// * a TLS `ClientHello` starts `0x16 0x03`, which reads as **5635**;
+/// * an SSH banner `SSH-2.0-...` starts `0x53 0x53`, which reads as **21331**.
+///
+/// All are an order of magnitude past any plausible frame at a normal MTU.
+///
+/// The bound is derived from the MTU rather than hard-coded because a tunnel
+/// with a large MTU legitimately produces large frames, and a fixed ceiling
+/// would reject them. [`MAX_TCP_FRAME`] disables the check (nothing can exceed
+/// it), which is what the client — which trusts the server it dialled — uses.
+pub fn plausible_frame_limit(mtu: u16) -> usize {
+    // MTU + crypto envelope + obfs header + headroom. 512 bytes of slack is
+    // generous: the envelope is well under 100 bytes for every cipher.
+    mtu as usize + 512
+}
 
 /// How long a **partially received** frame may stay incomplete before we reset.
 ///
@@ -399,6 +424,9 @@ enum NextFrame {
     /// Bytes are buffered but the rest of the frame did not arrive in time.
     /// This is what a probe looks like, and the caller should reset.
     Stalled,
+    /// The length prefix declared more bytes than any real frame could be
+    /// (`declared` bytes). Not our protocol — reset without waiting.
+    Implausible(usize),
 }
 
 /// A framed reader over any byte stream: one `read(2)` yields many frames.
@@ -414,15 +442,19 @@ struct FrameReader<R: AsyncRead + Unpin> {
     buf: Vec<u8>,
     start: usize,
     end: usize,
+    /// Declared lengths beyond this are not our protocol; see
+    /// [`plausible_frame_limit`].
+    plausible: usize,
 }
 
 impl<R: AsyncRead + Unpin> FrameReader<R> {
-    fn new(inner: R) -> Self {
+    fn new(inner: R, plausible: usize) -> Self {
         Self {
             inner,
             buf: vec![0u8; READ_BUF_BYTES],
             start: 0,
             end: 0,
+            plausible,
         }
     }
 
@@ -460,6 +492,9 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
                 if len == 0 {
                     self.start += TCP_LEN_PREFIX;
                     continue;
+                }
+                if len > self.plausible {
+                    return Ok(NextFrame::Implausible(len));
                 }
                 if self.end - self.start - TCP_LEN_PREFIX >= len {
                     let body = self.start + TCP_LEN_PREFIX;
@@ -550,12 +585,13 @@ async fn tcp_read_loop<R, T, F>(
     buf_len: usize,
     abort: Arc<ConnAbort>,
     validator: Option<Validator>,
+    plausible: usize,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
     F: Fn(Vec<u8>) -> T,
 {
-    let mut reader = FrameReader::new(reader);
+    let mut reader = FrameReader::new(reader, plausible);
     let mut frame = vec![0u8; buf_len];
     let signal = abort.signal();
     // Only the first frame is checked; see `Validator`.
@@ -583,6 +619,13 @@ where
         let n = match res {
             NextFrame::Frame(n) => n,
             NextFrame::Eof => return Ok(()), // peer closed
+            NextFrame::Implausible(declared) => {
+                warn!(
+                    "tcp: peer declared a {declared}-byte frame (max plausible {plausible}), resetting"
+                );
+                abort.fire();
+                return Ok(());
+            }
             NextFrame::Stalled => {
                 warn!(
                     "tcp: peer did not produce a complete frame in time{}, resetting",
@@ -673,19 +716,32 @@ async fn tcp_write_loop(
     }
 }
 
-/// Per-connection handle used to tear a connection down abruptly.
+/// Per-connection handle used to tear a connection down abruptly, emitting a
+/// TCP **RST** rather than a FIN.
 ///
-/// Held by [`TcpHub`] alongside the outbound queue so a reset can both stop
-/// sending and stop reading, which is what actually closes the socket.
+/// ## Why a socket has more than one file descriptor
+///
+/// `tokio::net::TcpStream::into_split()` hands out two halves that share one
+/// underlying socket, and we additionally hold a `dup()` of its fd. The socket
+/// — and therefore the RST — only happens when the **last** of those
+/// descriptors is closed. So a reset is a two-part job:
+///
+/// 1. arm `SO_LINGER` on the socket (see [`crate::net::arm_tcp_reset`]), which
+///    makes the eventual `close()` abortive;
+/// 2. drop every descriptor we hold and wake the tasks holding the rest.
+///
+/// Doing only (2) yields an orderly FIN close, which is the bug this replaces.
 struct ConnAbort {
-    /// Wakes both the reader and the writer task, so the connection's halves
-    /// are dropped promptly instead of whenever the peer happens to close.
+    /// Wakes the reader and writer tasks so they drop their socket halves.
     notify: Arc<Notify>,
-    /// A duplicate of the connection's fd, used to arm `SO_LINGER` so the
-    /// close emits RST rather than FIN. Absent off unix, where we fall back to
-    /// a plain (still immediate) teardown.
+    /// Our own duplicate of the connection's fd. `Mutex` because `fire` takes
+    /// it out to close it; held here so the socket survives until we decide
+    /// otherwise.
     #[cfg(unix)]
-    fd: Option<std::os::fd::OwnedFd>,
+    fd: StdMutex<Option<std::os::fd::OwnedFd>>,
+    /// Set once `SO_LINGER` has been armed, so repeated `fire()` calls are
+    /// harmless and the log line is emitted only once.
+    fired: AtomicBool,
 }
 
 impl ConnAbort {
@@ -698,7 +754,8 @@ impl ConnAbort {
         Self {
             notify: Arc::new(Notify::new()),
             #[cfg(unix)]
-            fd: None,
+            fd: StdMutex::new(None),
+            fired: AtomicBool::new(false),
         }
     }
 
@@ -706,7 +763,7 @@ impl ConnAbort {
     /// emits a RST.
     #[cfg(unix)]
     fn with_fd(mut self, fd: Option<std::os::fd::OwnedFd>) -> Self {
-        self.fd = fd;
+        self.fd = StdMutex::new(fd);
         self
     }
 
@@ -715,19 +772,37 @@ impl ConnAbort {
         Arc::clone(&self.notify)
     }
 
-    /// Stop the connection now, and make the close send RST.
+    /// Reset the connection now: arm an abortive close, then release every
+    /// descriptor so the socket actually closes and emits the RST.
     fn fire(&self) {
-        #[cfg(unix)]
-        if let Some(fd) = self.fd.as_ref() {
-            use std::os::fd::AsRawFd;
-            crate::net::force_reset_fd(fd.as_raw_fd());
+        if self.fired.swap(true, Ordering::SeqCst) {
+            return; // already reset
         }
-        // Notify *after* arming the linger, so the tasks that drop the socket
-        // (and therefore send the RST) run once it is set.
-        //
-        // `notify_waiters` wakes the loops that are parked right now;
-        // `notify_one` additionally stores a permit for a loop that is mid-
-        // iteration, so an abort is never lost.
+
+        #[cfg(unix)]
+        {
+            // Arm first, then close: SO_LINGER applies to the socket, so the
+            // order relative to *our* descriptor does not matter, but it must
+            // be set before the last close — and the last close is whichever
+            // task drops its half last, which we are about to wake.
+            let taken = self.fd.lock().ok().and_then(|mut g| g.take());
+            if let Some(fd) = taken {
+                use std::os::fd::AsRawFd;
+                crate::net::arm_tcp_reset(fd.as_raw_fd());
+                // Closing our duplicate drops this reference; the socket stays
+                // alive until the reader/writer halves are dropped below.
+                drop(fd);
+            } else {
+                // No duplicate to arm through (dup failed, or already fired).
+                // Still wake the tasks: Linux sends a RST on close when
+                // unread data is pending, which is the usual probe case.
+                log::debug!("force-reset: no socket fd to arm; closing without RST guarantee");
+            }
+        }
+
+        // Wake both tasks so they drop their halves. `notify_waiters` reaches
+        // the ones parked right now; `notify_one` stores a permit for a task
+        // that is mid-iteration, so the abort is never lost.
         self.notify.notify_waiters();
         self.notify.notify_one();
     }
@@ -752,6 +827,9 @@ pub struct TcpHub {
     aborts: RwLock<HashMap<SocketAddr, Arc<ConnAbort>>>,
     /// Applied to each connection's first frame; see [`Validator`].
     validator: Option<Validator>,
+    /// Declared frame lengths beyond this are rejected outright; see
+    /// [`plausible_frame_limit`].
+    plausible: usize,
     /// Monotonic counter mixed into unordered subflow selection (see
     /// [`pick_subflow`]).
     spins: AtomicU32,
@@ -766,6 +844,7 @@ impl TcpHub {
         addr: SocketAddr,
         buf_len: usize,
         validator: Option<Validator>,
+        plausible: usize,
     ) -> std::io::Result<Arc<Self>> {
         let listener: TcpListener = bind_tcp_listener(addr)?;
         let (tx, rx) = mpsc::channel(TCP_CHANNEL_DEPTH);
@@ -774,6 +853,7 @@ impl TcpHub {
             outbound: RwLock::new(HashMap::new()),
             aborts: RwLock::new(HashMap::new()),
             validator,
+            plausible,
             spins: AtomicU32::new(0),
         });
 
@@ -824,6 +904,7 @@ impl TcpHub {
                                 buf_len,
                                 read_abort,
                                 conn_validator,
+                                hub2.plausible,
                             )
                             .await
                             {
@@ -1056,6 +1137,7 @@ impl TcpClient {
             MAX_TCP_FRAME + crate::protocol::TCP_LEN_PREFIX,
             abort,
             None,
+            MAX_TCP_FRAME, // client trusts its server: no plausibility bound
         ));
 
         Ok((out_tx, local, reader_task))
@@ -1236,8 +1318,11 @@ impl Transport {
         addr: SocketAddr,
         buf_len: usize,
         validator: Option<Validator>,
+        plausible: usize,
     ) -> std::io::Result<Self> {
-        Ok(Transport::TcpServer(TcpHub::bind(addr, buf_len, validator).await?))
+        Ok(Transport::TcpServer(
+            TcpHub::bind(addr, buf_len, validator, plausible).await?,
+        ))
     }
 
     /// Dial a TCP server at `addr` with `subflows` parallel connections.
