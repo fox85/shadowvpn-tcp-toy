@@ -70,15 +70,16 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::OwnedWriteHalf;
-use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use log::{debug, info, warn};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 
 use crate::net::{bind_tcp_listener, connect_tcp_stream};
 
@@ -429,6 +430,93 @@ enum NextFrame {
     Implausible(usize),
 }
 
+/// Read half of a shared [`TcpStream`].
+///
+/// ## Why not `TcpStream::into_split()`
+///
+/// `into_split()` hands out halves whose teardown is not ours to control: the
+/// write half's path can issue an orderly `shutdown()`, which sends a **FIN** —
+/// and a force-reset must never send one. Observing a FIN+ACK alongside the RST
+/// is exactly that: graceful teardown ran first, then the abortive close.
+///
+/// Holding `Arc<TcpStream>` instead means teardown is a plain `close()` of the
+/// last file descriptor, and nothing ever calls `shutdown()`. With `SO_LINGER`
+/// armed (see [`crate::net::arm_tcp_reset`]) that emits a RST and nothing else;
+/// without it, a normal FIN close — so legitimate connections are unaffected.
+struct SharedRead(Arc<TcpStream>);
+
+/// Write half of a shared [`TcpStream`]; see [`SharedRead`].
+struct SharedWrite(Arc<TcpStream>);
+
+impl AsyncRead for SharedRead {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let stream = &*self.0;
+        loop {
+            // `try_read` is the polling-safe primitive: it never registers
+            // interest itself, so we stay in charge of readiness.
+            let dst = buf.initialize_unfilled();
+            if dst.is_empty() {
+                return Poll::Ready(Ok(()));
+            }
+            match stream.try_read(dst) {
+                Ok(0) => return Poll::Ready(Ok(())), // EOF
+                Ok(n) => {
+                    buf.advance(n);
+                    return Poll::Ready(Ok(()));
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+            match stream.poll_read_ready(cx) {
+                Poll::Ready(Ok(())) => continue,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl AsyncWrite for SharedWrite {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let stream = &*self.0;
+        loop {
+            match stream.try_write(buf) {
+                Ok(n) => return Poll::Ready(Ok(n)),
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Poll::Ready(Err(e)),
+            }
+            match stream.poll_write_ready(cx) {
+                Poll::Ready(Ok(())) => continue,
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        // `try_write` goes straight to the socket; there is no buffer to flush.
+        Poll::Ready(Ok(()))
+    }
+
+    /// Deliberately a no-op.
+    ///
+    /// A `shutdown()` is what sends a FIN, and this connection's teardown is
+    /// either an armed RST (force-reset) or a plain `close()` (normal end).
+    /// Nothing in the tunnel asks for a half-close, and offering one here would
+    /// only reintroduce the FIN+ACK we removed.
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// A framed reader over any byte stream: one `read(2)` yields many frames.
 ///
 /// TCP hands us bytes, not messages. The naive approach — `read_exact` the
@@ -670,7 +758,7 @@ where
 /// the same syscall. Sparse traffic therefore sees no added latency, while a
 /// burst collapses from N syscalls to one.
 async fn tcp_write_loop(
-    mut writer: OwnedWriteHalf,
+    mut writer: SharedWrite,
     mut outbound: mpsc::Receiver<Vec<u8>>,
     abort: Arc<Notify>,
 ) {
@@ -681,8 +769,9 @@ async fn tcp_write_loop(
         batch.clear();
         out.clear();
 
-        // Ends on force-reset too, so the write half is dropped promptly and
-        // the socket actually closes (which is what sends the RST).
+        // Ends on force-reset too, so this task drops its `Arc<TcpStream>`
+        // promptly and the socket actually closes (which is what sends the
+        // RST — see `SharedWrite`).
         match tokio::select! {
             _ = abort.notified() => None,
             v = outbound.recv() => v,
@@ -721,18 +810,20 @@ async fn tcp_write_loop(
 ///
 /// ## Why a socket has more than one file descriptor
 ///
-/// `tokio::net::TcpStream::into_split()` hands out two halves that share one
-/// underlying socket, and we additionally hold a `dup()` of its fd. The socket
-/// — and therefore the RST — only happens when the **last** of those
-/// descriptors is closed. So a reset is a two-part job:
+/// The reader and writer tasks each hold an `Arc<TcpStream>` (see
+/// [`SharedRead`]), and we additionally hold a `dup()` of the socket's fd. The
+/// socket — and therefore the RST — is only torn down when the **last** of
+/// those descriptors closes. So a reset is a two-part job:
 ///
 /// 1. arm `SO_LINGER` on the socket (see [`crate::net::arm_tcp_reset`]), which
 ///    makes the eventual `close()` abortive;
-/// 2. drop every descriptor we hold and wake the tasks holding the rest.
+/// 2. drop our descriptor and wake the tasks holding the rest.
 ///
 /// Doing only (2) yields an orderly FIN close, which is the bug this replaces.
+/// And (1) must not be paired with `shutdown()`, which sends a FIN of its own —
+/// see `arm_tcp_reset`.
 struct ConnAbort {
-    /// Wakes the reader and writer tasks so they drop their socket halves.
+    /// Wakes the reader and writer tasks so they drop their `Arc<TcpStream>`.
     notify: Arc<Notify>,
     /// Our own duplicate of the connection's fd. `Mutex` because `fire` takes
     /// it out to close it; held here so the socket survives until we decide
@@ -887,7 +978,12 @@ impl TcpHub {
                         let abort = Arc::new(ConnAbort::new());
                         hub2.aborts.write().await.insert(peer, Arc::clone(&abort));
 
-                        let (reader, writer) = stream.into_split();
+                        // Share one socket between the two tasks instead of
+                        // splitting it: see `SharedRead` for why.
+                        let shared = Arc::new(stream);
+                        let reader = SharedRead(Arc::clone(&shared));
+                        let writer = SharedWrite(Arc::clone(&shared));
+
                         let (out_tx, out_rx) = mpsc::channel(TCP_CHANNEL_DEPTH);
                         hub2.outbound.write().await.insert(peer, out_tx);
 
@@ -1123,7 +1219,12 @@ impl TcpClient {
     )> {
         let stream = connect_tcp_stream(server).await?;
         let local = stream.local_addr().ok();
-        let (reader, writer) = stream.into_split();
+        // Same shared-socket arrangement as the server; see `SharedRead`. The
+        // client never arms a RST, so this is purely about keeping one
+        // teardown path for both ends.
+        let shared = Arc::new(stream);
+        let reader = SharedRead(Arc::clone(&shared));
+        let writer = SharedWrite(Arc::clone(&shared));
 
         // The client never force-resets (it has exactly one server, and its
         // supervisor reconnects on its own), but both loops take a teardown

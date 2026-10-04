@@ -514,6 +514,61 @@ curl -v http://<server-ip>:8388/
 应看到服务端回 `Flags [R.]` 或 `[R]`（RST），**而不是** `[F.]`（FIN）。
 `curl` 侧报错应为 `Connection reset by peer`，而非 `Connection closed`。
 
+## 修正（第三轮）：服务端仍会发出 FIN+ACK
+
+抓包确认 RST 已经发出，但**同一次连接里还夹着一个 FIN+ACK**。期望是：握手失败的连接
+只发 RST，绝不发 FIN。
+
+### 根因：`into_split()` 的写半在 drop 时走优雅关闭
+
+上一版已经把 `shutdown()` 从 `arm_tcp_reset()` 里删掉了，我们自己的代码不再发 FIN。
+但 FIN 还有另一个来源，来自 tokio 而不是我们：
+
+```rust
+let (reader, writer) = stream.into_split();   // OwnedReadHalf / OwnedWriteHalf
+```
+
+`OwnedWriteHalf` 的销毁路径**不受我们控制**——它会走一次有序 `shutdown()`，也就是
+发 FIN。于是时序变成：
+
+1. 写半被 drop → `shutdown()` → **服务端发出 FIN+ACK**
+2. 之后所有 fd 归零 → `close()`，此时 SO_LINGER 已设 → **服务端发出 RST**
+
+抓包里 RST 与 FIN+ACK 同时出现，正是这两步叠加的结果。
+
+### 修正：不再 `into_split()`，改用 `Arc<TcpStream>` 共享同一个 socket
+
+新增 `SharedRead` / `SharedWrite`：各持一个 `Arc<TcpStream>`，用 `try_read` /
+`try_write` 配合 `poll_read_ready` / `poll_write_ready` 实现 `AsyncRead` /
+`AsyncWrite`。读写两个任务共享同一个 socket，但**没有任何人持有"写半"这种会在
+销毁时 shutdown 的对象**。
+
+于是销毁路径只剩一种：
+
+* 最后一个 `Arc<TcpStream>` 被 drop → tokio 直接 `close(fd)`（tokio 的 `TcpStream`
+  销毁只关 fd，不调 shutdown）
+* 若此时 SO_LINGER 已设（force-reset 场景）→ 内核发 **RST**，且**不会有 FIN**
+* 若未设（正常客户端断开）→ 一次普通的 FIN 关闭，合法连接行为不变
+
+另外把 `AsyncWrite::poll_shutdown` 显式写成**空操作**并注明原因：半关闭只会重新引入
+FIN，隧道也从不要求半关闭。
+
+### 为什么这比"想办法阻止写半 drop"更可靠
+
+阻止 drop 需要依赖 tokio 内部实现细节（写半到底会不会 shutdown、有没有 `forget()`
+之类的逃生口），版本一变就失效。而"根本不产生写半"是结构上的保证，与 tokio 内部
+行为无关。
+
+### 复验
+
+```sh
+sudo tcpdump -i any -nn 'host <server-ip> and port 8388'
+curl -v http://<server-ip>:8388/
+```
+
+该连接上服务端应**只有** `[R]` / `[R.]`，**不应出现** `[F.]` / `[F]`。
+若仍有 FIN，请确认抓的是被 reset 的那条连接（curl 可能因重试而新建连接）。
+
 ## 编译时开启硬件 AES
 
 引用说明："To use AES-GCM at full speed on ARM, build with the crypto features

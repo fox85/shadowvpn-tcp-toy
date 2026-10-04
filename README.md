@@ -213,10 +213,13 @@ The reset arms `SO_LINGER` with a zero timeout and then closes the socket, so th
 peer gets a **RST** instead of an orderly FIN — a scanner cannot even complete a
 handshake, and cannot keep pushing bytes at an open socket.
 
-> `SO_LINGER` and `shutdown()` are mutually exclusive: `shutdown()` *is* the
-> orderly teardown and sends a FIN, after which `close()` has nothing left to
-> abort. Only the `SO_LINGER` arm is used, and the RST is emitted when the
-> socket's last file descriptor closes.
+> Getting an RST and *nothing else* requires two things. `SO_LINGER` and
+> `shutdown()` are mutually exclusive — `shutdown()` *is* the orderly teardown
+> and sends a FIN, after which `close()` has nothing left to abort. And the
+> connection must not be created with `into_split()`, whose write half performs
+> a graceful shutdown when dropped (that is what produced a FIN+ACK alongside
+> the RST). Both halves therefore share one `Arc<TcpStream>`, so teardown is
+> only ever a `close()` of the last descriptor.
 
 This is safe against false positives: a frame that fails to authenticate is by
 construction not from a peer holding the shared key, so a correctly configured
