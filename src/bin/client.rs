@@ -128,6 +128,10 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
         info!("carrier obfuscation: {name}");
     }
     info!("carrier transport  : {}", cfg.transport.name());
+    info!("tunnel MTU         : {}", cfg.tun.mtu);
+    if cfg.transport.is_tcp() {
+        info!("parallel subflows  : {}", cfg.subflows);
+    }
     if cfg.cipher.is_none() {
         // Loud on purpose: `cipher=none` sends IP packets in the clear, and that
         // must never be something an operator discovers only by reading a config.

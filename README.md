@@ -79,13 +79,27 @@ cheap, and the two inner protocols need opposite treatment:
 | Inner protocol | Placement | Why |
 | --- | --- | --- |
 | **TCP** | pinned to one subflow | It is already ordered and recovers from loss itself; reordering it would cause duplicate ACKs and spurious fast retransmits. An outer stall just reads as a slow link. |
-| **UDP** (QUIC, WireGuard, games, VoIP) | spread across every healthy subflow | UDP has no retransmit timer, so a pinned UDP flow sees a *complete blackout* for the duration of the stall. Protocols that estimate RTT read that as a catastrophic path change — QUIC's probe timeout fires and its window collapses, which takes many round trips to rebuild. Spread over `N`, only `1/N` of the packets are caught and the rest keep arriving. |
+| **UDP** (QUIC, WireGuard, games, VoIP) | spread across every healthy subflow, rotating every [`UDP_ROTATE_EVERY`] packets | UDP has no retransmit timer, so a pinned UDP flow sees a *complete blackout* for the duration of the stall. Protocols that estimate RTT read that as a catastrophic path change — QUIC's probe timeout fires and its window collapses, which takes many round trips to rebuild. Spread over `N`, only `1/N` of the packets are caught and the rest keep arriving. |
 
 UDP tolerates reordering (it never promised any, and QUIC numbers its packets
 precisely so it can handle out-of-order arrival), so spreading costs it
 nothing — and it is what makes `--subflows` help a *single* UDP flow rather
 than only many flows at once. Unordered traffic additionally avoids any subflow
 whose send queue is backing up, so a stalled connection is routed around.
+
+**Rotation granularity matters.** Spreading per-*packet* would interleave one
+flow's packets across `N` connections with different queue depths, so they
+arrive continuously reordered — QUIC's reordering threshold is 3 packets, so
+continuous reordering reads as continuous loss and collapses its window.
+Instead the flow rotates every `UDP_ROTATE_EVERY` (16) packets: in-order runs
+keep loss detection quiet, while ~1.8 ms per run means dozens of rotations per
+RTT, so all subflows stay in flight and their windows still add up.
+
+**MTU differs by carrier.** UDP keeps the 1400 default (outer datagrams must
+fit the path MTU with room for headers and the crypto envelope). TCP has no
+such constraint — the kernel segments the stream to its own MSS — so it
+defaults to 1500, which stops UDP applications' usual 1460-byte datagrams from
+being IP-fragmented inside the tunnel. An explicit `--mtu` always wins.
 
 Server NAT mode (`--nat`) keys clients by endpoint, so a multi-subflow client
 would look like several clients: **use `subflows=1` with NAT.**
@@ -146,6 +160,55 @@ ceiling is that subflow's `window / RTT`. With a 4 MiB window:
 So 500 Mbit/s on a long path needs the window fix above plus multiple
 subflows; on a short path one subflow is plenty. Inner UDP spreads across all
 subflows and is not subject to this per-flow ceiling.
+
+## Building with hardware AES
+
+The `aes` crate detects AES-NI at **runtime** on x86_64, so a portable x86_64
+build already uses it when the CPU has it. **aarch64 is different**: there is no
+runtime dispatch, so the ARMv8 crypto instructions are only emitted when the
+`+aes` target feature is enabled at compile time. Without it, AES-GCM falls back
+to a software table implementation that is several times slower — on a
+router-class ARM core that is the difference between saturating a fast link and
+not.
+
+Enable it with:
+
+```sh
+# cross-compiling for aarch64
+RUSTFLAGS="-C target-feature=+aes,+neon" cargo build --release --target aarch64-unknown-linux-musl
+
+# or, when building on the device itself
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+The repo ships `.cargo/config.toml` with the aarch64 flags already set, and the
+release workflow repeats them per target.
+
+> **Check your hardware first.** AES is an *optional* ARMv8-A extension, and
+> enabling `+aes` produces instructions that raise `SIGILL` on a core without
+> it: `grep -m1 -o '\baes\b' /proc/cpuinfo`. Every mainstream core since
+> Cortex-A53/A57 has it (Pi 3/4, most routers, Apple Silicon, Graviton). If any
+> target device lacks it, drop `+aes` and keep `+neon`.
+
+`armv7` is deliberately left on default features: 32-bit ARM crypto support is
+far less uniform.
+
+## Anti-probing: force-reset on non-conforming frames
+
+With `"transport": "tcp"`, a server that receives a frame that is not valid
+ShadowVPN traffic **resets the connection immediately** rather than dropping the
+packet and staying connected:
+
+* a frame that does not match the configured obfuscation;
+* a frame whose AEAD tag does not authenticate (wrong PSK, or a probe).
+
+The reset sets `SO_LINGER` with a zero timeout and shuts the connection down, so
+the peer gets a RST instead of an orderly FIN — a scanner cannot even complete
+a handshake, and cannot keep pushing bytes at an open socket.
+
+This is safe against false positives: a frame that fails to authenticate is by
+construction not from a peer holding the shared key, so a correctly configured
+client never trips it.
 
 ## Disabling encryption (`cipher: "none"`)
 

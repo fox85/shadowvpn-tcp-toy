@@ -39,7 +39,7 @@ use crate::mesh::{
 };
 use crate::policy::{Mode, PolicyConfig};
 use crate::pool::host_range;
-use crate::protocol::DEFAULT_TUN_MTU;
+use crate::protocol::{DEFAULT_TUN_MTU, DEFAULT_TUN_MTU_TCP};
 use crate::state::default_client_state_path;
 
 /// Default cipher used when none is specified.
@@ -1040,6 +1040,16 @@ fn resolve_hostname(cli: Option<String>, file: Option<String>) -> String {
     magic::sanitize_hostname(&raw)
 }
 
+/// Pick the tunnel MTU: an explicit value always wins, otherwise the carrier
+/// decides (see [`DEFAULT_TUN_MTU_TCP`] for why TCP can afford 1500).
+fn resolve_mtu(mtu: Option<u16>, transport: TransportKind) -> u16 {
+    mtu.unwrap_or(if transport.is_tcp() {
+        DEFAULT_TUN_MTU_TCP
+    } else {
+        DEFAULT_TUN_MTU
+    })
+}
+
 /// Build the validated [`TunConfig`] from merged file + CLI values.
 #[allow(clippy::too_many_arguments)]
 fn resolve_tun(
@@ -1049,6 +1059,7 @@ fn resolve_tun(
     peer_ip: Option<Ipv4Addr>,
     ip6: Option<Ipv6Network>,
     mtu: Option<u16>,
+    transport: TransportKind,
 ) -> Result<TunConfig, ConfigError> {
     Ok(TunConfig {
         name,
@@ -1056,7 +1067,7 @@ fn resolve_tun(
         netmask: netmask.unwrap_or(DEFAULT_NETMASK),
         peer_ip: peer_ip.ok_or(ConfigError::Missing("peer_ip"))?,
         ip6,
-        mtu: mtu.unwrap_or(DEFAULT_TUN_MTU),
+        mtu: resolve_mtu(mtu, transport),
     })
 }
 
@@ -1069,6 +1080,7 @@ fn resolve_client_tun(
     peer_ip: Option<Ipv4Addr>,
     ip6: Option<Ipv6Network>,
     mtu: Option<u16>,
+    transport: TransportKind,
 ) -> Result<(TunConfig, bool, bool), ConfigError> {
     let auto_tun = match (ip, peer_ip) {
         (None, None) => true,
@@ -1090,7 +1102,7 @@ fn resolve_client_tun(
             netmask: netmask.unwrap_or(DEFAULT_NETMASK),
             peer_ip: peer_ip.unwrap_or(Ipv4Addr::UNSPECIFIED),
             ip6,
-            mtu: mtu.unwrap_or(DEFAULT_TUN_MTU),
+            mtu: resolve_mtu(mtu, transport),
         },
         auto_tun,
         want_ip6,
@@ -1221,6 +1233,7 @@ impl ServerArgs {
             self.peer_ip.or(file.peer_ip),
             self.tun_ip6.or(file.tun_ip6),
             self.mtu.or(file.mtu),
+            transport,
         )?;
 
         let obfs = file.obfs.filter(|s| !s.is_empty() && s != "none");
@@ -1330,6 +1343,7 @@ impl ClientArgs {
             self.peer_ip.or(file.peer_ip),
             self.tun_ip6.or(file.tun_ip6),
             self.mtu.or(file.mtu),
+            transport,
         )?;
 
         let obfs = file.obfs.filter(|s| !s.is_empty() && s != "none");
@@ -1582,6 +1596,45 @@ mod tests {
         assert_eq!(cfg.tun.netmask, DEFAULT_NETMASK);
         assert_eq!(cfg.tun.mtu, DEFAULT_TUN_MTU);
         assert_eq!(cfg.tun.name.as_deref(), Some("utun9"));
+    }
+
+    #[test]
+    fn tcp_transport_defaults_to_a_larger_tun_mtu() {
+        // UDP must keep 1400 so the outer datagram fits the path MTU; TCP has no
+        // such constraint (the stream is segmented to its own MSS), so it can
+        // carry a full 1500 — which is what stops UDP applications' usual
+        // 1460-byte datagrams from being IP-fragmented inside the tunnel.
+        let udp = ClientArgs {
+            config: None,
+            server: Some("host:1".to_string()),
+            password: Some("pw".to_string()),
+            transport: Some("udp".to_string()),
+            tun_ip: Some(Ipv4Addr::new(10, 0, 0, 2)),
+            peer_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            ..ClientArgs::empty()
+        };
+        assert_eq!(udp.resolve().unwrap().tun.mtu, DEFAULT_TUN_MTU);
+
+        let tcp = ClientArgs {
+            transport: Some("tcp".to_string()),
+            ..udp
+        };
+        assert_eq!(tcp.resolve().unwrap().tun.mtu, DEFAULT_TUN_MTU_TCP);
+
+        // An explicit MTU always wins, on either carrier.
+        let explicit = ClientArgs {
+            mtu: Some(1300),
+            ..ClientArgs {
+                config: None,
+                server: Some("host:1".to_string()),
+                password: Some("pw".to_string()),
+                transport: Some("tcp".to_string()),
+                tun_ip: Some(Ipv4Addr::new(10, 0, 0, 2)),
+                peer_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
+                ..ClientArgs::empty()
+            }
+        };
+        assert_eq!(explicit.resolve().unwrap().tun.mtu, 1300);
     }
 
     #[test]

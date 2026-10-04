@@ -77,7 +77,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 use log::{debug, info, warn};
 
 use crate::net::{bind_tcp_listener, connect_tcp_stream};
@@ -194,6 +194,33 @@ fn pick_subflow(backlogs: &[usize], hash: u32, spin: u32, ordered: bool) -> usiz
         .map(|(i, _)| i)
         .unwrap_or(0)
 }
+
+/// How many consecutive packets an unordered flow keeps on one subflow before
+/// rotating to the next.
+///
+/// This is the knob that trades **reordering** against **spreading**, and it
+/// matters more than it looks:
+///
+/// * `1` — rotate every packet. Maximum spreading, but a single flow's packets
+///   arrive interleaved from `N` connections whose queue depths differ, so they
+///   are *constantly* reordered. QUIC's reordering threshold is 3 packets, so
+///   continuous reordering is read as continuous loss: spurious loss detection
+///   collapses its congestion window and the flow never ramps up. That is the
+///   mechanism behind "UDP-in-TCP is slower than TCP-in-TCP despite more
+///   subflows".
+/// * `large` — the flow barely rotates, so it degenerates into being pinned and
+///   gets one congestion window.
+///
+/// A moderate value keeps **in-order runs** (so reordering counters and QUIC's
+/// loss detector stay quiet) while still cycling through every subflow many
+/// times per RTT — at 1400-byte packets and 100 Mbit/s that is ~9000 packets/s,
+/// so 16 packets is under 2 ms, i.e. dozens of rotations per RTT on a typical
+/// path. All subflows therefore stay in flight simultaneously and their windows
+/// still add up.
+///
+/// Set to `1` to restore per-packet round-robin (only useful if the receiver is
+/// genuinely reorder-proof), or raise it if a specific application is sensitive.
+pub const UDP_ROTATE_EVERY: u32 = 16;
 
 /// How a packet should be placed on the subflows.
 ///
@@ -411,6 +438,7 @@ async fn tcp_read_loop<R, T, F>(
     inbound: mpsc::Sender<T>,
     tag: F,
     buf_len: usize,
+    abort: Arc<Notify>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -419,9 +447,17 @@ where
     let mut reader = FrameReader::new(reader);
     let mut frame = vec![0u8; buf_len];
     loop {
-        let n = match reader.next_frame(&mut frame).await? {
-            Some(n) => n,
-            None => return Ok(()), // peer closed
+        // Also watch `abort`: a force-reset cannot rely on the peer to close,
+        // and the whole point is to stop reading from it immediately.
+        let n = tokio::select! {
+            r = reader.next_frame(&mut frame) => match r? {
+                Some(n) => n,
+                None => return Ok(()), // peer closed
+            },
+            _ = abort.notified() => {
+                debug!("tcp: read loop aborted by force-reset");
+                return Ok(());
+            }
         };
         if n == 0 {
             continue;
@@ -438,7 +474,11 @@ where
 /// else is already queued is then drained **without waiting** and written in
 /// the same syscall. Sparse traffic therefore sees no added latency, while a
 /// burst collapses from N syscalls to one.
-async fn tcp_write_loop(mut writer: OwnedWriteHalf, mut outbound: mpsc::Receiver<Vec<u8>>) {
+async fn tcp_write_loop(
+    mut writer: OwnedWriteHalf,
+    mut outbound: mpsc::Receiver<Vec<u8>>,
+    abort: Arc<Notify>,
+) {
     let mut batch: Vec<Vec<u8>> = Vec::with_capacity(WRITE_BATCH_FRAMES);
     let mut out: Vec<u8> = Vec::with_capacity(READ_BUF_BYTES);
 
@@ -446,9 +486,14 @@ async fn tcp_write_loop(mut writer: OwnedWriteHalf, mut outbound: mpsc::Receiver
         batch.clear();
         out.clear();
 
-        match outbound.recv().await {
+        // Ends on force-reset too, so the write half is dropped promptly and
+        // the socket actually closes (which is what sends the RST).
+        match tokio::select! {
+            _ = abort.notified() => None,
+            v = outbound.recv() => v,
+        } {
             Some(p) => batch.push(p),
-            None => return, // all senders dropped
+            None => return, // all senders dropped, or aborted
         }
         while batch.len() < WRITE_BATCH_FRAMES {
             match outbound.try_recv() {
@@ -476,6 +521,40 @@ async fn tcp_write_loop(mut writer: OwnedWriteHalf, mut outbound: mpsc::Receiver
     }
 }
 
+/// Per-connection handle used to tear a connection down abruptly.
+///
+/// Held by [`TcpHub`] alongside the outbound queue so a reset can both stop
+/// sending and stop reading, which is what actually closes the socket.
+struct ConnAbort {
+    /// Wakes both the reader and the writer task, so the connection's halves
+    /// are dropped promptly instead of whenever the peer happens to close.
+    notify: Arc<Notify>,
+    /// A duplicate of the connection's fd, used to arm `SO_LINGER` so the
+    /// close emits RST rather than FIN. Absent off unix, where we fall back to
+    /// a plain (still immediate) teardown.
+    #[cfg(unix)]
+    fd: Option<std::os::fd::OwnedFd>,
+}
+
+impl ConnAbort {
+    /// Stop the connection now, and make the close send RST.
+    fn fire(&self) {
+        #[cfg(unix)]
+        if let Some(fd) = self.fd.as_ref() {
+            use std::os::fd::AsRawFd;
+            crate::net::force_reset_fd(fd.as_raw_fd());
+        }
+        // Notify *after* arming the linger, so the tasks that drop the socket
+        // (and therefore send the RST) run once it is set.
+        //
+        // `notify_waiters` wakes the loops that are parked right now;
+        // `notify_one` additionally stores a permit for a loop that is mid-
+        // iteration, so an abort is never lost.
+        self.notify.notify_waiters();
+        self.notify.notify_one();
+    }
+}
+
 /// Server-side TCP carrier: many connections, presented as one packet source.
 ///
 /// `accept()` spawns a reader and a writer task per connection. Every reader
@@ -491,6 +570,8 @@ pub struct TcpHub {
     inbound: Mutex<mpsc::Receiver<(SocketAddr, Vec<u8>)>>,
     /// Per-peer outbound queue handles, replaced as connections come and go.
     outbound: RwLock<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>,
+    /// Per-peer teardown handles for [`TcpHub::force_reset`].
+    aborts: RwLock<HashMap<SocketAddr, Arc<ConnAbort>>>,
     /// Monotonic counter mixed into unordered subflow selection (see
     /// [`pick_subflow`]).
     spins: AtomicU32,
@@ -504,6 +585,7 @@ impl TcpHub {
         let hub = Arc::new(Self {
             inbound: Mutex::new(rx),
             outbound: RwLock::new(HashMap::new()),
+            aborts: RwLock::new(HashMap::new()),
             spins: AtomicU32::new(0),
         });
 
@@ -515,21 +597,55 @@ impl TcpHub {
                         if let Err(e) = crate::net::configure_tcp_stream(&stream) {
                             debug!("could not tune accepted TCP stream from {peer}: {e}");
                         }
+                        // Duplicate the fd *before* splitting: `setsockopt` and
+                        // `shutdown` on a duplicate still act on the socket, and
+                        // this keeps a handle we can reach from the hub later.
+                        #[cfg(unix)]
+                        let dup_fd = {
+                            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+                            // SAFETY: `raw` is a live fd; `dup` returns either
+                            // -1 or a fresh fd we take ownership of.
+                            let dupped = unsafe { libc::dup(stream.as_raw_fd()) };
+                            if dupped < 0 {
+                                None
+                            } else {
+                                Some(unsafe { OwnedFd::from_raw_fd(dupped) })
+                            }
+                        };
+                        let abort = Arc::new(ConnAbort {
+                            notify: Arc::new(Notify::new()),
+                            #[cfg(unix)]
+                            fd: dup_fd,
+                        });
+                        hub2.aborts.write().await.insert(peer, Arc::clone(&abort));
+
                         let (reader, writer) = stream.into_split();
                         let (out_tx, out_rx) = mpsc::channel(TCP_CHANNEL_DEPTH);
                         hub2.outbound.write().await.insert(peer, out_tx);
 
                         let hub3 = Arc::clone(&hub2);
                         let inbound_tx = tx.clone();
+                        let read_abort = Arc::clone(&abort);
                         tokio::spawn(async move {
-                            if let Err(e) =
-                                tcp_read_loop(reader, inbound_tx, move |p| (peer, p), buf_len).await
+                            if let Err(e) = tcp_read_loop(
+                                reader,
+                                inbound_tx,
+                                move |p| (peer, p),
+                                buf_len,
+                                read_abort.notify.clone(),
+                            )
+                            .await
                             {
                                 debug!("tcp connection from {peer} ended: {e}");
                             }
                             hub3.outbound.write().await.remove(&peer);
+                            hub3.aborts.write().await.remove(&peer);
                         });
-                        tokio::spawn(tcp_write_loop(writer, out_rx));
+                        tokio::spawn(tcp_write_loop(
+                            writer,
+                            out_rx,
+                            Arc::clone(&abort.notify),
+                        ));
                         info!("tcp: accepted connection from {peer}");
                     }
                     Err(e) => {
@@ -555,6 +671,27 @@ impl TcpHub {
         let n = payload.len().min(buf.len());
         buf[..n].copy_from_slice(&payload[..n]);
         Ok((n, peer))
+    }
+
+    /// Tear down `peer`'s connection immediately, emitting a TCP RST.
+    ///
+    /// This is the response to a frame that is not valid ShadowVPN traffic: a
+    /// port scan, a plain HTTP/`TLS` handshake, or a client with the wrong PSK.
+    /// Dropping the packet and staying connected is the wrong answer — the
+    /// connection stays open, the scanner learns a service is listening, and it
+    /// can keep pushing bytes at us. Resetting closes the door at once.
+    ///
+    /// Safe against false positives because a frame that fails to de-obfuscate
+    /// or to authenticate is, by construction, not from a peer holding the
+    /// shared key: AEAD rejects it. A correctly configured client therefore
+    /// never trips this.
+    async fn force_reset(&self, peer: &SocketAddr) {
+        // Stop queueing to it, so nothing more is written.
+        self.outbound.write().await.remove(peer);
+        if let Some(abort) = self.aborts.write().await.remove(peer) {
+            abort.fire();
+            warn!("tcp: force-reset connection from {peer}: non-conforming frame");
+        }
     }
 
     /// Queue `wire` for delivery to `peer`'s connection.
@@ -591,7 +728,8 @@ impl TcpHub {
             // preferred endpoint and keep it simple.
             let chosen = match hint {
                 Some(h) if peers.len() > 1 => {
-                    let spin = self.spins.fetch_add(1, Ordering::Relaxed);
+                    // Same epoch division as the client's `send_hint`.
+                    let spin = self.spins.fetch_add(1, Ordering::Relaxed) / UDP_ROTATE_EVERY;
                     let backlogs: Vec<usize> =
                         peers.iter().map(|p| backlog(outbound.get(p))).collect();
                     peers[pick_subflow(&backlogs, h.hash, spin, h.ordered)]
@@ -768,7 +906,9 @@ impl TcpClient {
             ));
         }
         let n = self.subflows.max(1);
-        let spin = self.spins.fetch_add(1, Ordering::Relaxed);
+        // Divide so `spin` only changes every UDP_ROTATE_EVERY packets: see that
+        // constant for why a per-packet counter is counter-productive.
+        let spin = self.spins.fetch_add(1, Ordering::Relaxed) / UDP_ROTATE_EVERY;
         let idx = {
             let outbound = self.outbound.read().await;
             let backlogs: Vec<usize> = (0..n).map(|i| backlog(slot_of(&outbound, i))).collect();
@@ -993,6 +1133,19 @@ impl Transport {
                 let _ = hub;
                 Ok(())
             }
+        }
+    }
+
+    /// Tear down `peer`'s connection immediately, emitting a TCP RST.
+    ///
+    /// The server calls this on a frame that is not valid ShadowVPN traffic;
+    /// see [`TcpHub::force_reset`]. A no-op on the carriers where there is no
+    /// connection to reset (UDP) or nothing to reset (the client has one
+    /// server, and its supervisor will reconnect on its own).
+    pub async fn force_reset(&self, peer: &SocketAddr) {
+        match self {
+            Transport::TcpServer(hub) => hub.force_reset(peer).await,
+            _ => debug!("force-reset requested for {peer} but this carrier has no per-peer connection"),
         }
     }
 

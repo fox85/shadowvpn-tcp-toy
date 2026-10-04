@@ -30,6 +30,27 @@ use crate::crypto::{Cipher, TAG_LEN};
 /// path.
 pub const DEFAULT_TUN_MTU: u16 = 1400;
 
+/// Default tunnel MTU when the carrier is **TCP**, in bytes.
+///
+/// On the UDP carrier the tunnel MTU must leave room for the outer IP + UDP +
+/// crypto headers inside the path MTU, or the outer datagram fragments. On TCP
+/// there is no such constraint: the outer TCP stream is segmented to its own
+/// MSS regardless of how large one frame is, and it retransmits, so a large
+/// frame costs nothing in reliability. That frees the tunnel MTU to be a full
+/// 1500.
+///
+/// This matters most for **UDP traffic inside the tunnel**. UDP has no MSS
+/// clamping, so an application sending its usual 1460-byte datagram (iperf3's
+/// default, and typical of games, VoIP, WireGuard at 1420, QUIC at 1350) into a
+/// 1400-byte tunnel gets **IP-fragmented into two packets** — or dropped with
+/// `EMSGSIZE` if DF is set. Fragmentation doubles the packet count and makes
+/// the datagram survive only if *every* fragment survives, which is why
+/// UDP-in-TCP throughput collapses while TCP-in-TCP is unaffected.
+///
+/// 1500 fits those datagrams whole. It is the largest safe value because after
+/// decapsulation the server forwards the packet out a real 1500-byte interface.
+pub const DEFAULT_TUN_MTU_TCP: u16 = 1500;
+
 /// A generous upper bound on the plaintext IP packet size we will read from the
 /// TUN device in a single read, in bytes.
 ///

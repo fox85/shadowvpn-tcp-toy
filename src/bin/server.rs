@@ -457,7 +457,11 @@ async fn udp_to_tun(
                         &decoded
                     }
                     None => {
-                        debug!("dropping {n}-byte non-obfs datagram from {peer}");
+                        // Not our framing at all: a probe, or a client with a
+                        // different obfs setting. Reset rather than leave the
+                        // connection open for it to keep guessing.
+                        debug!("force-resetting {peer}: {n}-byte non-obfs frame");
+                        socket_out.force_reset(&peer).await;
                         continue;
                     }
                 },
@@ -467,8 +471,11 @@ async fn udp_to_tun(
             let mut plaintext = match decrypt_packet(cipher, &cfg.master_key, datagram) {
                 Ok(pt) => pt,
                 Err(err) => {
-                    // Bad PSK, corruption, or stray traffic — drop and continue.
-                    debug!("dropping {n}-byte datagram from {peer}: decrypt failed: {err}");
+                    // AEAD authentication failed, which means the sender does
+                    // not hold the shared key: a probe or a misconfigured
+                    // client. Reset so it cannot keep probing this connection.
+                    debug!("force-resetting {peer}: {n}-byte frame failed to authenticate: {err}");
+                    socket_out.force_reset(&peer).await;
                     continue;
                 }
             };

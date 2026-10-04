@@ -280,6 +280,50 @@ fn tune_socket(sock: &Socket) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Force `fd`'s connection to end abruptly, so a peer that sent a
+/// non-conforming frame gets nothing usable back.
+///
+/// Two steps, in this order:
+///
+/// 1. `SO_LINGER` with a **zero** timeout makes the eventual `close()` send
+///    **RST** instead of FIN. Without it the connection lingers in FIN_WAIT
+///    and the peer sees an orderly close — which a scanner can still read as
+///    "a service is here".
+/// 2. `shutdown(SHUT_RDWR)` ends the connection *now* rather than waiting for
+///    the application to notice: a pending `read` returns EOF, so the reader
+///    task wakes up and drops the socket, which is what sends the RST.
+///
+/// `fd` may be a duplicate of the socket's fd: `setsockopt` and `shutdown` act
+/// on the socket itself, not on the descriptor.
+#[cfg(unix)]
+pub fn force_reset_fd(fd: std::os::fd::RawFd) {
+    unsafe {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        if libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const libc::linger as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        ) != 0
+        {
+            log::debug!(
+                "could not set SO_LINGER for force-reset: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        if libc::shutdown(fd, libc::SHUT_RDWR) != 0 {
+            log::debug!(
+                "could not shutdown socket for force-reset: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 /// Transaction id for the bootstrap server-resolution query. The socket is
 /// connected to a single upstream and only one query is in flight, so the exact
 /// value does not matter; a fixed non-zero id keeps things deterministic.

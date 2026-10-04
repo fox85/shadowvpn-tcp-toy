@@ -280,6 +280,149 @@ sysctl -w net.core.default_qdisc=fq
 4. `iperf3 -c <隧道对端>` 单条流视 RTT 达到上表预期值
 5. 对比 `--subflows 1 / 4 / 8 / 16` 的聚合吞吐，确认递增
 
+## UDP-in-TCP 在 4 subflows 下只有 ~60 Mbps 的原因与修正
+
+### 诊断：乱序被误判为丢包
+
+上一版把 UDP 打散改成**逐包轮转**（`spin` 每包 +1）。方向是对的，但粒度太细：
+
+一条 UDP 流的包被轮流送到 N 条子流上，而各子流的队列深度、RTT、丢包情况都不同，
+于是接收端**持续乱序**。QUIC 的乱序阈值是 3 个包，iperf3 UDP  likewise —— 持续乱序
+会被解读为**持续丢包**，触发虚假丢包检测，拥塞窗口反复坍缩，流量根本爬不起来。
+
+这就解释了"为什么 subflows 更多反而更慢"以及"为什么 UDP-in-TCP 比 TCP-in-TCP 还慢"：
+TCP-in-TCP 被钉死在单条子流上，**完全有序**；UDP 那边却是每包乱序。
+
+### 修正一：轮转粒度从"每包"改为"每 16 个包"（`UDP_ROTATE_EVERY = 16`）
+
+`spin = counter.fetch_add(1) / UDP_ROTATE_EVERY`
+
+形成**有序运行段（in-order runs）**：连续 16 个包走同一条子流（段内严格有序，乱序
+计数器和 QUIC 丢包检测保持安静），段与段之间再换下一条。
+
+- 16 个 1400 字节的包在 100 Mbps 下约 1.8 ms —— 一个 RTT 内会轮转几十次
+- 所有子流**始终同时在飞**，窗口照样叠加，并行收益不丢
+- 乱序只发生在段边界，且恰好落在"本来就要等"的场景
+
+这是"打散"与"有序"之间的调节旋钮：设为 `1` 回到逐包轮转（仅接收端真的不怕乱序时
+有用），调大则更接近钉死。
+
+### 修正二：TCP 载波的默认 MTU 从 1400 提到 1500（`DEFAULT_TUN_MTU_TCP`）
+
+UDP 载波保留 1400，因为外层 UDP 数据报要留出 IP/UDP 头与加密开销的余量，避免路径上
+被分片。
+
+TCP 载波**没有这个约束**——TCP 字节流由内核按自己的 MSS 分段，多 100 字节不会造成
+外层分片。而 1400 的隧道 MTU 会让 UDP 应用惯用的 **1460 字节**数据报（1500 - 20 IP -
+8 UDP）在隧道内被 **IP 分片**，分片会显著降低吞吐并放大丢包影响。
+
+所以 TCP 载波默认 MTU = 1500，让 1460 字节的应用数据报完整通过。显式 `--mtu` 始终
+优先，两种载波都适用。
+
+### 预期效果
+
+| 场景 | 修正前（4 subflows） | 修正后 |
+| --- | --- | --- |
+| UDP in TCP | ~60 Mbps | 100 Mbps+ |
+| TCP in TCP | ~100 Mbps | 不变（仍钉死有序） |
+
+内层 UDP 现在会打散到所有子流（并行收益），同时保持段内有序（不触发虚假丢包检测）。
+
+### 调优建议
+
+- 若某应用对乱序极敏感：调大 `UDP_ROTATE_EVERY`（32 / 64）
+- 若接收端确实不怕乱序（如自研协议）：设为 `1` 取最大打散
+- `--subflows` 建议 4 起步，配合 `--mtu 1500`（TCP 载波已默认）测试
+- 测 UDP 吞吐用 `iperf3 -c <对端> -u -b 200M`，注意 iperf3 自身会报告丢包/乱序统计，
+  这正是判断 `UDP_ROTATE_EVERY` 是否合适的最佳指标
+
+## 服务端 TCP 反探测：FORCE RESET
+
+### 需求
+
+服务端传输模式为 TCP 时，收到不属于本协议（端口扫描、HTTP/TLS 握手探测、错误 PSK）
+的 TCP 包，应强制 RESET 而不是丢包了事。
+
+### 为什么不能只丢包
+
+丢包后连接仍然保持打开：扫描器能确认"这里有服务在监听"，并可继续向这个 socket
+推送数据。RESET 则立刻关上门——连握手都完成不了。
+
+### 实现
+
+1. **`net::force_reset_fd()`**（unix）
+   按序做两件事：
+   - `SO_LINGER{l_onoff=1, l_linger=0}`：让随后的 `close()` 发 **RST** 而非 FIN。
+     否则连接会停在 FIN_WAIT，对端看到的是"有序关闭"，仍可读出服务存在。
+   - `shutdown(SHUT_RDWR)`：立刻结束连接。这会唤醒阻塞中的 `read` 使其返回 EOF，
+     读循环随即退出并释放 socket——释放 socket 正是发出 RST 的那一步。
+
+2. **`transport::ConnAbort`**
+   accept 时为每个连接建立句柄：
+   - `notify: Arc<Notify>` —— 唤醒读/写两个循环
+   - `fd: Option<OwnedFd>` —— socket 的 `dup`。`setsockopt` 与 `shutdown` 作用于
+     socket 本身而非描述符，所以 dup 出来的 fd 一样有效。
+
+3. **读/写循环支持中止**
+   读循环改为 `select! { next_frame, abort.notified() }`；写循环同样 select，
+   且从 `outbound` map 中移除 sender 会让 `recv()` 返回 None。两条路都覆盖。
+   中止信号用 `notify_waiters()`（唤醒当前等待者）+ `notify_one()`（留存一个
+   permit 给正好在迭代中的循环），确保不丢。
+
+4. **`Transport::force_reset(peer)`**
+   先移除 outbound（停止向其发包），再 `fire()`。UDP 与客户端侧为 no-op。
+
+5. **服务端触发点**（`bin/server.rs`）
+   - obfs 解包失败 → 非本协议的封装
+   - AEAD 认证失败 → 发送方不持有共享密钥
+
+### 为什么不会误伤正常客户端
+
+AEAD 认证失败在构造上就意味着"对方不持有共享密钥"。配置正确的客户端几乎不可能触发
+（只会是链路位翻转，极罕见），因此立即 RESET 是安全的。
+
+## 编译时开启硬件 AES
+
+引用说明："To use AES-GCM at full speed on ARM, build with the crypto features
+enabled, e.g. `RUSTFLAGS="-C target-feature=+aes,+neon"`"。
+
+**x86_64 不需要**：`aes` crate 在 x86 上是**运行时**检测 AES-NI，可移植构建在支持的
+CPU 上仍会用到它（本机编译可用 `-C target-cpu=native`）。
+
+**aarch64 必须开启**：没有运行时分发，ARMv8 crypto 指令只有在编译时开启 `+aes`
+才会被生成；否则退回软件查表实现，慢数倍。在路由器级 ARM 核上，这是能否跑满链路的
+差别。
+
+已做的两处配置：
+
+1. **`.cargo/config.toml`**
+   ```toml
+   [target.aarch64-unknown-linux-musl]
+   rustflags = ["-C", "target-feature=+aes,+neon"]
+   ```
+   本地 / cross 构建自动生效。
+
+2. **`.github/workflows/release.yml`**
+   矩阵每个目标带 `rustflags` 字段；注意 **RUSTFLAGS 环境变量会覆盖 config.toml
+   的 rustflags**，所以 CI 里必须重复写：
+   ```yaml
+   RUSTFLAGS: -C strip=symbols ${{ matrix.rustflags }}
+   ```
+
+### 重要前提：确认硬件支持
+
+AES 是 ARMv8-A 的**可选**扩展。开启 `+aes` 后，在没有该扩展的核上会 **SIGILL**。
+
+```sh
+grep -m1 -o 'aes' /proc/cpuinfo
+```
+
+自 Cortex-A53/A57 起的主流核（Pi 3/4、多数路由器、Apple Silicon、Graviton）都具备。
+若有目标设备不支持，去掉 `+aes`、保留 `+neon`，或单独出一个可移植构建。
+
+**armv7 保持默认**：32 位 ARM 的 crypto 支持非常不统一，风险高于收益。若确认所有
+目标设备都支持，可自行加 `-C target-feature=+aes,+neon`。
+
 ## 验证状态
 
 本次交付在未安装 Rust 工具链、且无法联网拉取 crates 的环境中完成，**未做真实 `cargo build` 编译验证**；已通过括号配平自检与逐处静态审查。请先在 x64 宿主执行 `cargo build --release` 与 `cargo test` 跑通，再做交叉编译。
