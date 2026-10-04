@@ -852,8 +852,13 @@ impl TcpClient {
         let local = stream.local_addr().ok();
         let (reader, writer) = stream.into_split();
 
+        // The client never force-resets (it has exactly one server, and its
+        // supervisor reconnects on its own), but both loops take an abort so
+        // the same functions serve either end.
+        let abort = Arc::new(Notify::new());
+
         let (out_tx, out_rx) = mpsc::channel(TCP_CHANNEL_DEPTH);
-        tokio::spawn(tcp_write_loop(writer, out_rx));
+        tokio::spawn(tcp_write_loop(writer, out_rx, Arc::clone(&abort)));
 
         let tx = inbound_tx.clone();
         let reader_task = tokio::spawn(tcp_read_loop(
@@ -861,6 +866,7 @@ impl TcpClient {
             tx,
             |p| p,
             MAX_TCP_FRAME + crate::protocol::TCP_LEN_PREFIX,
+            abort,
         ));
 
         Ok((out_tx, local, reader_task))
