@@ -47,7 +47,9 @@ use shadowvpn::mesh::{
 use shadowvpn::nat::{Ingress, Nat};
 use shadowvpn::obfs::{self, Obfuscator};
 use shadowvpn::pool::host_range;
-use shadowvpn::protocol::{max_datagram_size, max_tcp_wire_size, MAX_IP_PACKET};
+use shadowvpn::protocol::{
+    max_datagram_size, max_tcp_frame_size, max_tcp_wire_size, MAX_IP_PACKET,
+};
 use shadowvpn::transport::{FlowHint, Transport};
 use shadowvpn::tun_device::TunDevice;
 
