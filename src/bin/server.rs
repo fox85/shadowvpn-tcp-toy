@@ -67,7 +67,24 @@ struct ClientEntry {
     /// Every endpoint this client is currently reachable via.
     peers: Vec<SocketAddr>,
     last_seen: Instant,
+    /// When this entry was last *fully* re-checked (owner validation + peer
+    /// list scan); see [`Learned::touch`] for why that is not every packet.
+    learn_checked: Instant,
 }
+
+/// How often a known client's routing entry is fully re-validated.
+///
+/// Every ingress packet used to run the whole learning path: resolve the
+/// address's owner, validate the peer against it, then linearly scan the peer
+/// list. Under a global routing lock that is a write on every single packet,
+/// and at ~45k packets/s (500 Mbit/s of 1400-byte frames) it is a measurable
+/// share of one core plus constant cache-line bouncing between workers.
+///
+/// But the mapping essentially never changes mid-flow — a client's subflows are
+/// established at connect time. So re-validate on a timer instead: packets in
+/// between only refresh `last_seen`, which is the field the expiry sweep reads.
+/// Worst case a genuinely new endpoint is honoured a fraction of a second late.
+const LEARN_REFRESH: Duration = Duration::from_millis(200);
 
 /// Cap on how many endpoints one client can be learned on.
 ///
@@ -111,6 +128,27 @@ struct Learned {
 }
 
 impl Learned {
+    /// Refresh a known client's liveness; `true` if nothing more is needed.
+    ///
+    /// Fast path for the per-packet learning work. Returns `true` when the
+    /// entry exists and was fully validated within [`LEARN_REFRESH`], so the
+    /// caller can skip the owner check and the peer-list scan entirely and
+    /// move on to routing. See [`LEARN_REFRESH`] for why that is safe.
+    fn touch(&mut self, src: IpAddr, now: Instant) -> bool {
+        match self.clients.get_mut(&src) {
+            Some(entry) => {
+                // Always keep liveness current: the expiry sweep reads it.
+                entry.last_seen = now;
+                if now.saturating_duration_since(entry.learn_checked) < LEARN_REFRESH {
+                    return true;
+                }
+                entry.learn_checked = now;
+                false
+            }
+            None => false,
+        }
+    }
+
     /// Record that `src` is reachable via `peer`, logging on change.
     /// Refreshes `last_seen` so a quiet-but-still-sending client stays live.
     fn learn(&mut self, src: IpAddr, peer: SocketAddr, via: &str) {
@@ -137,6 +175,7 @@ impl Learned {
             ClientEntry {
                 peers: vec![peer],
                 last_seen: now,
+                learn_checked: now,
             },
         );
         info!("client {src} reachable via {peer}{via}");
@@ -473,7 +512,7 @@ async fn udp_to_tun(
     obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
     let cipher = cfg.cipher;
-    let workers = shadowvpn::worker_count();
+    let workers = shadowvpn::worker_count(Some(cfg.workers));
 
     // One channel per worker. The reader hashes each packet's shard key so a
     // peer's packets always land on the same worker and keep their order.
@@ -619,7 +658,16 @@ async fn udp_to_tun(
                 match &mut *guard {
                     Routing::Learn(state) => {
                         if let Some(src) = ip_src(&plaintext) {
-                            maybe_learn(&mut state.learned, &state.assigner, src, peer, "");
+                            // Data-plane fast path: for a client whose mapping
+                            // was validated within `LEARN_REFRESH`, `touch`
+                            // only refreshes liveness and we skip the owner
+                            // check and peer-list scan entirely. This is the
+                            // hottest thing done under the global routing lock
+                            // — once per ingress packet — and the mapping does
+                            // not change mid-flow.
+                            if !state.learned.touch(src, now) {
+                                maybe_learn(&mut state.learned, &state.assigner, src, peer, "");
+                            }
                         } else {
                             debug!("datagram from {peer} is not a parseable IP packet; forwarding");
                         }
@@ -707,7 +755,7 @@ async fn tun_to_udp(
     obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
     let cipher = cfg.cipher;
-    let workers = shadowvpn::worker_count();
+    let workers = shadowvpn::worker_count(Some(cfg.workers));
 
     // One channel per worker, dispatched on the inner 5-tuple hash. TUN hands
     // us plaintext, so this is the one place the inner flow can be hashed

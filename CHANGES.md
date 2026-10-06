@@ -404,6 +404,154 @@ sysctl -w net.core.default_qdisc=fq
 
 `iperf3 -P 8` 测聚合（单流只能吃到一条子流）。启动日志若有窗口告警，按提示调 sysctl。
 
+## 2 核 ARM 实测解读：一个核 100%，另一个 43%
+
+### 这组数字说明什么
+
+总用量约 1.43 核，而不是接近 2.0。说明**第二个核没吃饱**——不是"CPU 不够"，是
+**并行度不足 + 负载不均**。
+
+结合调度设计，最可能的原因是单条内层流被钉死：
+
+* 上行（TUN→carrier）按内层 5 元组哈希分片，一条流恒定落一个 worker；
+* 下行（carrier→TUN）按子流索引分片，而**有序流量（内层 TCP）被钉死单子流**，
+  所以一条流的所有回包也只从一个子流回来 → 也是一个 worker。
+
+结果：两个方向各只有少量 worker 真正忙，其余空转。iperf3 单流（`-P 1`）时最明显——
+**再多 worker 也只用到一个**。请确认测试用的是 `-P 8`；若已经是多流而第二核仍只有
+43%，再看下面的 cipher 因素。
+
+### 新增：`--workers N`（便于实测定位）
+
+```bash
+shadowvpn-client -c client.json -t tcp --workers 4
+```
+
+```json
+{ "transport": "tcp", "workers": 4 }
+```
+
+显式值原样生效（下限 1），不做二次猜测——这个参数就是用来量瓶颈在哪的。默认仍由
+CPU 核数推导（`available_parallelism()` clamp 到 2..=8）。
+
+**怎么用**：在 2 核上依次试 1 / 2 / 4 / 8。
+
+* 吞吐基本不变 → 瓶颈不在 worker 数，而在串行读路径或 cipher；
+* 吞吐明显上升 → 之前是并行度不足；
+* 吞吐**下降** → 任务超订阅，切换开销反噬。
+
+### 先做这个实验：`cipher: none` 对照
+
+这是区分"CPU 花在加解密"还是"花在 I/O 与调度"的最快办法：
+
+```bash
+# 两端同时改为 none，同样跑 iperf3 -P 8
+shadowvpn-server -l 0.0.0.0:8388 -t tcp -m none --tun-ip 10.9.0.1 --peer-ip 10.9.0.2
+shadowvpn-client -s host:8388 -t tcp -m none --workers 2
+```
+
+* `none` 下能到 500 Mbps → 瓶颈是 AEAD，换 cipher 或接受更低目标；
+* `none` 下仍只有约 100 Mbps → 瓶颈是 syscall / 串行读，加 worker 无用。
+
+### ARM 上的 cipher 选择
+
+`aarch64` 构建已开 `+aes,+neon`。但两者快慢取决于具体核心：
+
+| 核心 | 建议 |
+| --- | --- |
+| Cortex-A53 / A55（多数廉价盒子、部分路由器）| `chacha20-poly1305` |
+| Cortex-A72 / A76 及更高、Apple Silicon、Graviton | `aes-256-gcm`（PMULL 加速 GHASH）|
+
+**实测两遍，别猜。** 同样的思路，在目标设备上编译比交叉编译更快：
+
+```bash
+RUSTFLAGS="-C target-cpu=native" cargo build --release
+```
+
+（`.cargo/config.toml` 里已有注释备好的一行；注意 `target-cpu=native` 的产物不跨机
+可移植。）
+
+### 关于 500 Mbps 这个目标，需要说实话
+
+2 核 ARM 是很紧的约束。粗算（假设 1.5 GHz）：
+
+```
+500 Mbit/s ÷ (1400 B × 8) ≈ 44,600 pps（单向），双向约 89,000 pps
+两核合计预算 ≈ 3e9 / 89e3 ≈ 33,000 cycles/包
+```
+
+而每包实际要花：AEAD 双向约 3,000–6,000 cycles、四次 syscall 约 12,000 cycles、
+拷贝/哈希/调度约 5,000 cycles——合计约 20,000–23,000 cycles。
+
+**理论上够，但余量很小**，任何一项超预期（更慢的核、更大的 pps、丢包重传）都会掉
+下来。所以：
+
+* `cipher: none` 或最轻 cipher 下，500 Mbps 有希望；
+* 完整 AEAD 下，2 核 ARM 上更现实的预期是 200–350 Mbps；
+* 若必须 500 Mbps 且要加密，换 4 核以上的机器比继续调代码更直接。
+
+## "再加线程能不能提速" —— 不能，瓶颈不在这里
+
+### 先澄清：线程早就开了
+
+`#[tokio::main]` **默认就是多线程 runtime**（`flavor = "multi_thread"`，worker
+threads = CPU 核数）。加上上一轮的 N 个 worker（`worker_count()`，2..=8），
+AEAD / de-obfs 已经在多核上并行了。所以"再增加程序线程"不会带来可观收益——
+线程已经够，问题在别处。
+
+### 真正的天花板：单 fd 串行 I/O
+
+阿姆达尔定律。无论后面有多少 worker，两个方向的**读**都各是一个任务：
+
+* 服务端：`tun_to_udp` 的 reader 读 TUN；`udp_to_tun` 的 reader 读 carrier
+* 客户端：`tun_to_net` 的 reader 读 TUN；`net_to_tun` 的 reader 读 carrier
+
+TUN 和 carrier socket 各自只有**一个 fd，只能顺序读**。每包固定成本：
+
+1. 一次 `read` syscall
+2. 一次 `to_vec()` **堆分配** + memcpy
+3. `classify()` 哈希
+4. 一次 channel send
+
+这条路径**无法并行**——它的吞吐上限就是整条链路的上限，后面的 worker 再多也喂不饱。
+此外还有两个共享点：服务端每包一把全局 `std::sync::Mutex<Routing>`；所有 worker
+写同一个 TUN fd，内核侧串行化。
+
+### 量化
+
+500 Mbit/s ÷ (1400 B × 8) ≈ **44,600 pps**，双向约 90,000 pps
+⇒ 单 reader 每包预算约 **11 µs**。而一次 syscall + 一次堆分配就已接近这个量级。
+所以这是硬天花板，不是参数没调好。
+
+### 本轮实际做的改进：入口学习节流
+
+服务端学习模式（默认）下，**每个入站包**都要在全局路由锁内走完整套：
+
+```
+resolve owner (node_for_ip4/ip6) → node_for_peer → learn() → get_mut → peers.contains()
+```
+
+其中 `peers.contains()` 是 O(n) 线性扫描，且整段是**写**操作——在 45k pps 下既吃一个核
+的份额，又让多个 worker 反复争抢同一条 cache line。
+
+但映射在流建立后就**不再变化**（子流在连接时确定）。所以改为定时重校验：
+
+* 新增 `ClientEntry::learn_checked` 与 `Learned::touch()`
+* 数据面热路径先调 `touch(src, now)`：命中且距上次完整校验 < `LEARN_REFRESH`
+  (200 ms) 时，**只刷新 `last_seen`** 并跳过 owner 校验与 peer 扫描
+* `maybe_learn()` 本身语义未变，控制消息路径与既有测试不受影响
+* 最坏情况：一个真正的新 endpoint 被延迟最多 200 ms 采纳
+
+### 若还要继续往上，方向是"减少每包固定开销"，不是"加线程"
+
+1. **消除 `to_vec()`** —— 缓冲池化 / `bytes::Bytes`，去掉每包堆分配
+2. **批量 I/O** —— TUN 侧 `readv`/`writev` 一次搬运多包，摊薄 syscall
+3. **多队列 TUN** —— Linux `IFF_MULTI_QUEUE`，每个 fd 一条队列，读写才真能并行
+   （需确认 tun-rs 2.8 是否暴露该能力）
+
+前两项需要改通道传递的类型，第三项依赖库支持——都属于较大重构，建议先确认当前
+实测离目标差多少再决定是否投入。
+
 ## TCP 随机长度填充（Padding）
 
 ### 需求

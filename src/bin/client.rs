@@ -562,7 +562,7 @@ async fn tun_to_net(
     assigned_ok: Arc<AtomicBool>,
     dns: DnsResolverSlot,
 ) -> Result<()> {
-    let workers = shadowvpn::worker_count();
+    let workers = shadowvpn::worker_count(Some(cfg.workers));
 
     // One channel per worker, dispatched on the inner 5-tuple hash: TUN hands
     // us plaintext, so the inner flow can be hashed directly. A given inner
@@ -728,7 +728,7 @@ async fn net_to_tun(
     // Fan out to several workers: decryption is per-packet CPU work, and one
     // task doing it serially caps throughput at roughly one core. Distributing
     // by subflow index keeps each worker's share stable.
-    let workers = shadowvpn::worker_count();
+    let workers = shadowvpn::worker_count(Some(cfg.workers));
     let mut tasks = JoinSet::new();
     let mut txs = Vec::with_capacity(workers);
     let mut rxs = Vec::with_capacity(workers);

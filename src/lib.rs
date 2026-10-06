@@ -151,7 +151,13 @@ pub mod uri;
 /// Sized from the machine: enough workers to matter on a big box, but capped
 /// because beyond a handful the shared routing/NAT state becomes the
 /// contention rather than the crypto.
-pub fn worker_count() -> usize {
+pub fn worker_count(requested: Option<usize>) -> usize {
+    if let Some(n) = requested {
+        // An explicit value is honoured as-is (floored at 1): it is the knob
+        // for measuring where the bottleneck actually is, so do not second
+        // guess it.
+        return n.max(1);
+    }
     std::thread::available_parallelism()
         .map(|n| n.get().clamp(2, 8))
         .unwrap_or(4)
