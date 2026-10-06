@@ -93,6 +93,8 @@ impl QuicObfs {
         n
     }
 
+    /// Obfuscate into a freshly allocated buffer (the non-pooled path, used for
+    /// control traffic where the cost does not matter).
     pub fn wrap(&self, datagram: &[u8]) -> Vec<u8> {
         let mut out = vec![0u8; self.header_len() + datagram.len()];
         let n = self.wrap_slice(&mut out, datagram);
