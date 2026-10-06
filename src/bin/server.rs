@@ -40,7 +40,7 @@ use tokio::task::JoinSet;
 
 use shadowvpn::assign::{Assigner, Lease};
 use shadowvpn::config::{ServerArgs, ServerConfig};
-use shadowvpn::crypto::{decrypt_into, encrypt_into};
+use shadowvpn::crypto::{decrypt_into, decrypt_packet, encrypt_into};
 use shadowvpn::magic::{NameOutcome, NameTable};
 use shadowvpn::mesh::{
     self, Assign, AssignStatus, Control, PeerPush, RouteApproval, RoutePush, SubnetTable,
