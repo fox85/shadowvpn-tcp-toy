@@ -40,7 +40,7 @@ use tokio::task::JoinSet;
 
 use shadowvpn::assign::{Assigner, Lease};
 use shadowvpn::config::{ServerArgs, ServerConfig};
-use shadowvpn::crypto::{decrypt_packet, encrypt_packet};
+use shadowvpn::crypto::{decrypt_into, encrypt_into};
 use shadowvpn::magic::{NameOutcome, NameTable};
 use shadowvpn::mesh::{
     self, Assign, AssignStatus, Control, PeerPush, RouteApproval, RoutePush, SubnetTable,
@@ -48,6 +48,7 @@ use shadowvpn::mesh::{
 use shadowvpn::nat::{Ingress, Nat};
 use shadowvpn::obfs::{self, Obfuscator};
 use shadowvpn::pool::host_range;
+use shadowvpn::bufpool::{Buf, BufPool};
 use shadowvpn::protocol::{
     max_datagram_size, max_tcp_frame_size, max_tcp_wire_size, MAX_IP_PACKET,
 };
@@ -67,7 +68,24 @@ struct ClientEntry {
     /// Every endpoint this client is currently reachable via.
     peers: Vec<SocketAddr>,
     last_seen: Instant,
+    /// When this entry was last *fully* re-checked (owner validation + peer
+    /// list scan); see [`Learned::touch`] for why that is not every packet.
+    learn_checked: Instant,
 }
+
+/// How often a known client's routing entry is fully re-validated.
+///
+/// Every ingress packet used to run the whole learning path: resolve the
+/// address's owner, validate the peer against it, then linearly scan the peer
+/// list. Under a global routing lock that is a write on every single packet,
+/// and at ~45k packets/s (500 Mbit/s of 1400-byte frames) it is a measurable
+/// share of one core plus constant cache-line bouncing between workers.
+///
+/// But the mapping essentially never changes mid-flow — a client's subflows are
+/// established at connect time. So re-validate on a timer instead: packets in
+/// between only refresh `last_seen`, which is the field the expiry sweep reads.
+/// Worst case a genuinely new endpoint is honoured a fraction of a second late.
+const LEARN_REFRESH: Duration = Duration::from_millis(200);
 
 /// Cap on how many endpoints one client can be learned on.
 ///
@@ -111,6 +129,27 @@ struct Learned {
 }
 
 impl Learned {
+    /// Refresh a known client's liveness; `true` if nothing more is needed.
+    ///
+    /// Fast path for the per-packet learning work. Returns `true` when the
+    /// entry exists and was fully validated within [`LEARN_REFRESH`], so the
+    /// caller can skip the owner check and the peer-list scan entirely and
+    /// move on to routing. See [`LEARN_REFRESH`] for why that is safe.
+    fn touch(&mut self, src: IpAddr, now: Instant) -> bool {
+        match self.clients.get_mut(&src) {
+            Some(entry) => {
+                // Always keep liveness current: the expiry sweep reads it.
+                entry.last_seen = now;
+                if now.saturating_duration_since(entry.learn_checked) < LEARN_REFRESH {
+                    return true;
+                }
+                entry.learn_checked = now;
+                false
+            }
+            None => false,
+        }
+    }
+
     /// Record that `src` is reachable via `peer`, logging on change.
     /// Refreshes `last_seen` so a quiet-but-still-sending client stays live.
     fn learn(&mut self, src: IpAddr, peer: SocketAddr, via: &str) {
@@ -137,6 +176,7 @@ impl Learned {
             ClientEntry {
                 peers: vec![peer],
                 last_seen: now,
+                learn_checked: now,
             },
         );
         info!("client {src} reachable via {peer}{via}");
@@ -473,12 +513,12 @@ async fn udp_to_tun(
     obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
     let cipher = cfg.cipher;
-    let workers = shadowvpn::worker_count();
+    let workers = shadowvpn::worker_count(Some(cfg.workers));
 
     // One channel per worker. The reader hashes each packet's shard key so a
     // peer's packets always land on the same worker and keep their order.
-    let mut txs: Vec<mpsc::Sender<(SocketAddr, Vec<u8>)>> = Vec::with_capacity(workers);
-    let mut rxs: Vec<mpsc::Receiver<(SocketAddr, Vec<u8>)>> = Vec::with_capacity(workers);
+    let mut txs: Vec<mpsc::Sender<(SocketAddr, Buf)>> = Vec::with_capacity(workers);
+    let mut rxs: Vec<mpsc::Receiver<(SocketAddr, Buf)>> = Vec::with_capacity(workers);
     for _ in 0..workers {
         // Per-worker depth: the total stays ~CHANNEL_DEPTH, so backpressure
         // still bounds memory the same way one big channel did.
@@ -500,14 +540,18 @@ async fn udp_to_tun(
             } else {
                 max_datagram_size(cipher) + obfs::MAX_HEADER
             };
-            let mut buf = vec![0u8; buf_len];
+            let pool = Arc::new(BufPool::new(buf_len, workers * 4, workers * 32));
             loop {
+                // One buffer per packet, recycled: the hot path no longer
+                // allocates or copies.
+                let mut buf = pool.take();
                 let (n, peer, shard) = socket
-                    .recv_sharded(&mut buf)
+                    .recv_sharded(buf.as_mut_slice())
                     .await
                     .with_context(|| format!("{} recv failed", socket.name()))?;
+                buf.set_len(n);
                 let slot = shard % workers;
-                if txs[slot].send((peer, buf[..n].to_vec())).await.is_err() {
+                if txs[slot].send((peer, buf)).await.is_err() {
                     return Ok(()); // workers gone; nothing left to feed
                 }
             }
@@ -531,6 +575,16 @@ async fn udp_to_tun(
         let cfg = Arc::clone(&cfg);
         let routing = Arc::clone(&routing);
         let tun = Arc::clone(&tun);
+        // Decrypted plaintext lands here; recycled the same way the inbound
+        // buffers are, so the hot path allocates nothing.
+        let pool = Arc::new(BufPool::new(MAX_IP_PACKET, 64, 256));
+        // Outbound buffers must also hold the crypto + obfs overhead on top of
+        // a full-size IP packet, hence their own larger capacity.
+        let out_pool = Arc::new(BufPool::new(
+            max_datagram_size(cipher) + obfs::MAX_HEADER,
+            64,
+            256,
+        ));
         tasks.spawn(async move {
         while let Some((peer, pkt)) = rx.recv().await {
             let n = pkt.len();
@@ -557,7 +611,7 @@ async fn udp_to_tun(
                 None => &pkt,
             };
 
-            let mut plaintext = match decrypt_packet(cipher, &cfg.master_key, datagram) {
+            let mut plaintext = match decrypt_into(&pool, cipher, &cfg.master_key, datagram) {
                 Ok(pt) => pt,
                 Err(err) => {
                     // AEAD authentication failed, which means the sender does
@@ -585,6 +639,7 @@ async fn udp_to_tun(
                         cipher,
                         &cfg.master_key,
                         &obfuscator,
+                        &out_pool,
                         &encode_control(&reply),
                         &Route::single(peer),
                         None,
@@ -619,7 +674,16 @@ async fn udp_to_tun(
                 match &mut *guard {
                     Routing::Learn(state) => {
                         if let Some(src) = ip_src(&plaintext) {
-                            maybe_learn(&mut state.learned, &state.assigner, src, peer, "");
+                            // Data-plane fast path: for a client whose mapping
+                            // was validated within `LEARN_REFRESH`, `touch`
+                            // only refreshes liveness and we skip the owner
+                            // check and peer-list scan entirely. This is the
+                            // hottest thing done under the global routing lock
+                            // — once per ingress packet — and the mapping does
+                            // not change mid-flow.
+                            if !state.learned.touch(src, now) {
+                                maybe_learn(&mut state.learned, &state.assigner, src, peer, "");
+                            }
                         } else {
                             debug!("datagram from {peer} is not a parseable IP packet; forwarding");
                         }
@@ -641,7 +705,7 @@ async fn udp_to_tun(
                             None => Action::Tun,
                         }
                     }
-                    Routing::Nat(nat) => match nat.ingress(peer, &mut plaintext, now) {
+                    Routing::Nat(nat) => match nat.ingress(peer, plaintext.as_mut(), now) {
                         Ingress::Rewritten(_) => Action::Tun,
                         Ingress::Exhausted => {
                             warn!("NAT address pool exhausted; dropping packet from {peer}");
@@ -668,6 +732,7 @@ async fn udp_to_tun(
                         cipher,
                         &cfg.master_key,
                         &obfuscator,
+                        &out_pool,
                         &plaintext,
                         &route,
                         Some(hint),
@@ -707,15 +772,15 @@ async fn tun_to_udp(
     obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
     let cipher = cfg.cipher;
-    let workers = shadowvpn::worker_count();
+    let workers = shadowvpn::worker_count(Some(cfg.workers));
 
     // One channel per worker, dispatched on the inner 5-tuple hash. TUN hands
     // us plaintext, so this is the one place the inner flow can be hashed
     // directly — and spreading it is what lets several cores do the AEAD work.
     // A given inner connection always hashes to the same worker, so it keeps
     // its order.
-    let mut txs: Vec<mpsc::Sender<Vec<u8>>> = Vec::with_capacity(workers);
-    let mut rxs: Vec<mpsc::Receiver<Vec<u8>>> = Vec::with_capacity(workers);
+    let mut txs: Vec<mpsc::Sender<Buf>> = Vec::with_capacity(workers);
+    let mut rxs: Vec<mpsc::Receiver<Buf>> = Vec::with_capacity(workers);
     for _ in 0..workers {
         let (tx, rx) = mpsc::channel(CHANNEL_DEPTH / workers + 64);
         txs.push(tx);
@@ -727,15 +792,17 @@ async fn tun_to_udp(
     let mut tasks = JoinSet::new();
     {
         let tun = Arc::clone(&tun);
+        let pool = Arc::new(BufPool::new(MAX_IP_PACKET, workers * 4, workers * 32));
         tasks.spawn(async move {
-            let mut buf = vec![0u8; MAX_IP_PACKET];
             loop {
+                let mut buf = pool.take();
                 let n = tun
-                    .recv(&mut buf)
+                    .recv(buf.as_mut_slice())
                     .await
                     .context("failed to read from TUN")?;
-                let slot = shadowvpn::transport::classify(&buf[..n]).hash as usize % workers;
-                if txs[slot].send(buf[..n].to_vec()).await.is_err() {
+                buf.set_len(n);
+                let slot = shadowvpn::transport::classify(&buf).hash as usize % workers;
+                if txs[slot].send(buf).await.is_err() {
                     return Ok(());
                 }
             }
@@ -748,6 +815,11 @@ async fn tun_to_udp(
         let obfuscator = obfuscator.clone();
         let cfg = Arc::clone(&cfg);
         let routing = Arc::clone(&routing);
+        let out_pool = Arc::new(BufPool::new(
+            max_datagram_size(cipher) + obfs::MAX_HEADER,
+            64,
+            256,
+        ));
         tasks.spawn(async move {
         while let Some(mut pkt) = rx.recv().await {
             let n = pkt.len();
@@ -771,7 +843,7 @@ async fn tun_to_udp(
                                 .lookup(dst, hint.hash, now, cfg.lease_ttl)
                         })
                     }
-                    Routing::Nat(nat) => nat.egress(&mut pkt, now).map(Route::single),
+                    Routing::Nat(nat) => nat.egress(pkt.as_mut(), now).map(Route::single),
                 }
             };
 
@@ -784,7 +856,7 @@ async fn tun_to_udp(
             };
             let peer = route.preferred;
 
-            let datagram = match encrypt_packet(cipher, &cfg.master_key, &pkt) {
+            let datagram = match encrypt_into(&out_pool, cipher, &cfg.master_key, &pkt) {
                 Ok(d) => d,
                 Err(err) => {
                     warn!("failed to encrypt packet for {peer}: {err}");
@@ -794,7 +866,7 @@ async fn tun_to_udp(
 
             // Shape the reply to look like a QUIC packet when obfuscation is on.
             let datagram = match obfuscator {
-                Some(ref o) => o.wrap(&datagram),
+                Some(ref o) => o.wrap_into(&out_pool, &datagram),
                 None => datagram,
             };
 
@@ -1137,12 +1209,13 @@ async fn send_ciphered(
     cipher: shadowvpn::crypto::Cipher,
     master_key: &[u8],
     obfuscator: &Option<Arc<Obfuscator>>,
+    pool: &Arc<BufPool>,
     plaintext: &[u8],
     route: &Route,
     hint: Option<FlowHint>,
 ) {
     let peer = route.preferred;
-    let datagram = match encrypt_packet(cipher, master_key, plaintext) {
+    let datagram = match encrypt_into(pool, cipher, master_key, plaintext) {
         Ok(d) => d,
         Err(err) => {
             warn!(
@@ -1153,7 +1226,7 @@ async fn send_ciphered(
         }
     };
     let datagram = match obfuscator {
-        Some(o) => o.wrap(&datagram),
+        Some(o) => o.wrap_into(pool, &datagram),
         None => datagram,
     };
     if let Err(err) = socket

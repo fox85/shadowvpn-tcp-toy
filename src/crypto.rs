@@ -26,6 +26,8 @@
 //! TUN interface, with no address header. Everything else (salt, HKDF subkey,
 //! zero nonce, AEAD tag) matches the shadowsocks UDP AEAD scheme byte-for-byte.
 
+use std::sync::Arc;
+
 use aead::{AeadInOut, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use chacha20poly1305::ChaCha20Poly1305;
@@ -33,6 +35,8 @@ use hkdf::Hkdf;
 use md5::{Digest, Md5};
 use rand::RngExt;
 use sha1::Sha1;
+
+use crate::bufpool::{Buf, BufPool};
 
 /// AEAD nonce length in bytes. All supported ciphers use a 12-byte nonce.
 pub const NONCE_LEN: usize = 12;
@@ -293,29 +297,81 @@ pub fn encrypt_packet(
     master_key: &[u8],
     plaintext: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
+    let need = cipher.salt_len() + plaintext.len() + TAG_LEN;
+    let mut out = vec![0u8; need];
+    let n = seal_into(&mut out, cipher, master_key, plaintext)?;
+    out.truncate(n);
+    Ok(out)
+}
+
+/// Encrypt into a buffer taken from `pool`, avoiding a per-packet allocation.
+///
+/// The data-plane counterpart of [`encrypt_packet`]; see [`crate::bufpool`].
+pub fn encrypt_into(
+    pool: &Arc<BufPool>,
+    cipher: Cipher,
+    master_key: &[u8],
+    plaintext: &[u8],
+) -> Result<Buf, CryptoError> {
+    let mut buf = pool.take();
+    let n = seal_into(buf.as_mut_slice(), cipher, master_key, plaintext)?;
+    buf.set_len(n);
+    Ok(buf)
+}
+
+/// Core of [`encrypt_packet`] / [`encrypt_into`]: build `salt ++ ciphertext ++
+/// tag` into the caller's buffer and return its length.
+///
+/// Writes into a slice rather than growing a `Vec` so the buffer can be a
+/// pooled one that keeps its full length across reuse (see
+/// [`crate::bufpool`] for why re-zeroing it each time would defeat the point).
+fn seal_into(
+    out: &mut [u8],
+    cipher: Cipher,
+    master_key: &[u8],
+    plaintext: &[u8],
+) -> Result<usize, CryptoError> {
     let salt_len = cipher.salt_len();
 
     // `none`: the wire datagram *is* the IP packet. No salt, no subkey, no tag.
     if cipher.is_none() {
-        return Ok(plaintext.to_vec());
+        return copy_into(out, plaintext);
     }
 
-    // Build the datagram in a single buffer: `salt ++ plaintext`, then encrypt
-    // the plaintext region in place and append the tag. One allocation total.
-    let mut datagram = Vec::with_capacity(salt_len + plaintext.len() + TAG_LEN);
-    datagram.resize(salt_len, 0);
+    let need = salt_len + plaintext.len() + TAG_LEN;
+    if out.len() < need {
+        return Err(CryptoError::TooShort {
+            got: out.len(),
+            need,
+        });
+    }
+
     // `rand::rng()` is an OS-seeded, cryptographically secure thread-local RNG;
     // each datagram gets a fresh random salt written straight into the buffer.
-    rand::rng().fill(&mut datagram[..salt_len]);
+    rand::rng().fill(&mut out[..salt_len]);
 
     let mut subkey = [0u8; MAX_KEY_LEN];
     let subkey = &mut subkey[..cipher.key_len()];
-    derive_subkey(master_key, &datagram[..salt_len], subkey)?;
+    derive_subkey(master_key, &out[..salt_len], subkey)?;
 
-    datagram.extend_from_slice(plaintext);
-    let tag = aead_seal_in_place(cipher, subkey, &mut datagram[salt_len..])?;
-    datagram.extend_from_slice(&tag);
-    Ok(datagram)
+    // Encrypt the plaintext region in place, then append the detached tag.
+    let body = &mut out[salt_len..salt_len + plaintext.len()];
+    body.copy_from_slice(plaintext);
+    let tag = aead_seal_in_place(cipher, subkey, body)?;
+    out[salt_len + plaintext.len()..need].copy_from_slice(&tag);
+    Ok(need)
+}
+
+/// Copy `src` into `out`; `TooShort` if it does not fit.
+fn copy_into(out: &mut [u8], src: &[u8]) -> Result<usize, CryptoError> {
+    if out.len() < src.len() {
+        return Err(CryptoError::TooShort {
+            got: out.len(),
+            need: src.len(),
+        });
+    }
+    out[..src.len()].copy_from_slice(src);
+    Ok(src.len())
 }
 
 /// Decrypt one wire datagram back into the plaintext IP packet.
@@ -333,12 +389,41 @@ pub fn decrypt_packet(
     master_key: &[u8],
     datagram: &[u8],
 ) -> Result<Vec<u8>, CryptoError> {
+    let mut out = vec![0u8; datagram.len()];
+    let n = open_into(&mut out, cipher, master_key, datagram)?;
+    out.truncate(n);
+    Ok(out)
+}
+
+/// Decrypt into a buffer taken from `pool`, avoiding a per-packet allocation.
+///
+/// The data-plane counterpart of [`decrypt_packet`]; see [`crate::bufpool`].
+pub fn decrypt_into(
+    pool: &Arc<BufPool>,
+    cipher: Cipher,
+    master_key: &[u8],
+    datagram: &[u8],
+) -> Result<Buf, CryptoError> {
+    let mut buf = pool.take();
+    let n = open_into(buf.as_mut_slice(), cipher, master_key, datagram)?;
+    buf.set_len(n);
+    Ok(buf)
+}
+
+/// Core of [`decrypt_packet`] / [`decrypt_into`]: write the authenticated
+/// plaintext into the caller's buffer and return its length.
+fn open_into(
+    out: &mut [u8],
+    cipher: Cipher,
+    master_key: &[u8],
+    datagram: &[u8],
+) -> Result<usize, CryptoError> {
     let salt_len = cipher.salt_len();
 
     // `none`: the datagram is already the plaintext IP packet, unsalted and
     // unauthenticated. There is nothing to verify — and nothing to reject.
     if cipher.is_none() {
-        return Ok(datagram.to_vec());
+        return copy_into(out, datagram);
     }
 
     let need = salt_len + TAG_LEN;
@@ -354,12 +439,19 @@ pub fn decrypt_packet(
     let subkey = &mut subkey[..cipher.key_len()];
     derive_subkey(master_key, salt, subkey)?;
 
-    // `rest` is `ciphertext ++ tag`; decrypt the ciphertext in place into a fresh
-    // owned buffer (the one allocation) and verify against the detached tag.
+    // `rest` is `ciphertext ++ tag`: copy the ciphertext into `out` and decrypt
+    // it there, verifying against the detached tag.
     let (ciphertext, tag) = rest.split_at(rest.len() - TAG_LEN);
-    let mut plaintext = ciphertext.to_vec();
-    aead_open_in_place(cipher, subkey, &mut plaintext, tag)?;
-    Ok(plaintext)
+    if out.len() < ciphertext.len() {
+        return Err(CryptoError::TooShort {
+            got: out.len(),
+            need: ciphertext.len(),
+        });
+    }
+    let body = &mut out[..ciphertext.len()];
+    body.copy_from_slice(ciphertext);
+    aead_open_in_place(cipher, subkey, body, tag)?;
+    Ok(ciphertext.len())
 }
 
 #[cfg(test)]

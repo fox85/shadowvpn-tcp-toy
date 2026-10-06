@@ -42,11 +42,12 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
 use shadowvpn::config::{ClientArgs, ClientConfig, TunConfig};
-use shadowvpn::crypto::{decrypt_packet, encrypt_packet, Cipher};
+use shadowvpn::crypto::{decrypt_into, encrypt_into, encrypt_packet, Cipher};
 use shadowvpn::magic::{apply_push, PeerTable};
 use shadowvpn::mesh::{self, Assign, AssignStatus, RouteInstaller};
 use shadowvpn::obfs::{self, Obfuscator};
-use shadowvpn::protocol::{max_datagram_size, max_tcp_frame_size, max_tcp_wire_size, MAX_IP_PACKET};
+use shadowvpn::bufpool::{Buf, BufPool};
+use shadowvpn::protocol::{max_datagram_size, max_tcp_wire_size, MAX_IP_PACKET};
 use shadowvpn::state::{default_client_state_path, write_private};
 use shadowvpn::transport::{Transport, MAX_PADDING, MAX_TCP_FRAME};
 use shadowvpn::tun_device::{SubnetRouteGuard, TunDevice};
@@ -344,6 +345,7 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
     let (assign_tx, mut assign_rx) = mpsc::channel::<Assign>(8);
 
     // --- Relay + keepalive tasks -------------------------------------------
+    let workers = shadowvpn::worker_count(Some(cfg.workers));
     let mut up = tokio::spawn(tun_to_net(
         Arc::clone(&tun),
         Arc::clone(&socket),
@@ -352,6 +354,7 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
         obfuscator.clone(),
         Arc::clone(&assigned_ok),
         Arc::clone(&dns_slot),
+        workers,
     ));
 
     let mut down = tokio::spawn(net_to_tun(
@@ -364,6 +367,7 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
         cfg.auto_tun.then_some(assign_tx),
         Arc::clone(&peers),
         magic_suffix,
+        workers,
     ));
 
     // Static clients keep the 5-byte keepalive / RouteAdvert / NameAdvert tick.
@@ -561,14 +565,14 @@ async fn tun_to_net(
     obfuscator: Option<Arc<Obfuscator>>,
     assigned_ok: Arc<AtomicBool>,
     dns: DnsResolverSlot,
+    workers: usize,
 ) -> Result<()> {
-    let workers = shadowvpn::worker_count();
 
     // One channel per worker, dispatched on the inner 5-tuple hash: TUN hands
     // us plaintext, so the inner flow can be hashed directly. A given inner
     // connection always lands on the same worker, so it keeps its order.
-    let mut txs: Vec<mpsc::Sender<Vec<u8>>> = Vec::with_capacity(workers);
-    let mut rxs: Vec<mpsc::Receiver<Vec<u8>>> = Vec::with_capacity(workers);
+    let mut txs: Vec<mpsc::Sender<Buf>> = Vec::with_capacity(workers);
+    let mut rxs: Vec<mpsc::Receiver<Buf>> = Vec::with_capacity(workers);
     for _ in 0..workers {
         let (tx, rx) = mpsc::channel(CHANNEL_DEPTH / workers + 64);
         txs.push(tx);
@@ -581,24 +585,26 @@ async fn tun_to_net(
     let mut tasks = JoinSet::new();
     {
         let assigned_ok = Arc::clone(&assigned_ok);
+        let pool = Arc::new(BufPool::new(MAX_IP_PACKET, workers * 4, workers * 32));
         tasks.spawn(async move {
-        // Plaintext buffer sized for the largest IP packet we might read.
-        let mut buf = vec![0u8; MAX_IP_PACKET];
         loop {
+            // Recycled buffer: the hot path allocates and copies nothing.
+            let mut buf = pool.take();
             let n = tun_reader
-                .recv(&mut buf)
+                .recv(buf.as_mut_slice())
                 .await
                 .context("failed to read from TUN device")?;
             if n == 0 {
                 continue;
             }
+            buf.set_len(n);
             // Unaddressed / cached-but-unconfirmed TUN still emits IPv6 NS.
             if !assigned_ok.load(Ordering::Acquire) {
                 debug!("dropping {n}-byte TUN packet until Assign Ok");
                 continue;
             }
-            let slot = shadowvpn::transport::classify(&buf[..n]).hash as usize % workers;
-            if txs[slot].send(buf[..n].to_vec()).await.is_err() {
+            let slot = shadowvpn::transport::classify(&buf).hash as usize % workers;
+            if txs[slot].send(buf).await.is_err() {
                 return Ok(());
             }
         }
@@ -612,6 +618,13 @@ async fn tun_to_net(
         let master_key = Arc::clone(&master_key);
         let obfuscator = obfuscator.clone();
         let dns = dns.clone();
+        // Outbound buffers carry a full-size IP packet plus crypto + obfs
+        // overhead, so they get their own larger capacity.
+        let out_pool = Arc::new(BufPool::new(
+            max_datagram_size(cipher) + obfs::MAX_HEADER,
+            64,
+            256,
+        ));
         tasks.spawn(async move {
         // Consecutive transient send failures (see `is_transient_udp_error`):
         // warn once when a burst starts, then stay quiet until it clears.
@@ -647,7 +660,7 @@ async fn tun_to_net(
             // Encrypt this IP packet into one on-wire datagram. A crypto failure
             // here is non-fatal (skip the packet) — it should not normally happen
             // since we control the key and input.
-            let datagram = match encrypt_packet(cipher, &master_key, &pkt) {
+            let datagram = match encrypt_into(&out_pool, cipher, &master_key, &pkt) {
                 Ok(d) => d,
                 Err(e) => {
                     warn!("failed to encrypt a {n}-byte packet, dropping: {e}");
@@ -657,7 +670,7 @@ async fn tun_to_net(
 
             // Apply carrier obfuscation (if enabled) just before the wire.
             let wire = match obfuscator {
-                Some(ref o) => o.wrap(&datagram),
+                Some(ref o) => o.wrap_into(&out_pool, &datagram),
                 None => datagram,
             };
 
@@ -724,16 +737,16 @@ async fn net_to_tun(
     assign_tx: Option<mpsc::Sender<Assign>>,
     peers: Arc<PeerTable>,
     magic_suffix: String,
+    workers: usize,
 ) -> Result<()> {
     // Fan out to several workers: decryption is per-packet CPU work, and one
     // task doing it serially caps throughput at roughly one core. Distributing
     // by subflow index keeps each worker's share stable.
-    let workers = shadowvpn::worker_count();
     let mut tasks = JoinSet::new();
-    let mut txs = Vec::with_capacity(workers);
-    let mut rxs = Vec::with_capacity(workers);
+    let mut txs: Vec<mpsc::Sender<Buf>> = Vec::with_capacity(workers);
+    let mut rxs: Vec<mpsc::Receiver<Buf>> = Vec::with_capacity(workers);
     for _ in 0..workers {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH / workers + 64);
+        let (tx, rx) = mpsc::channel(CHANNEL_DEPTH / workers + 64);
         txs.push(tx);
         rxs.push(rx);
     }
@@ -746,16 +759,17 @@ async fn net_to_tun(
         } else {
             max_datagram_size(cipher) + obfs::MAX_HEADER
         };
+        let pool = Arc::new(BufPool::new(buf_len, workers * 4, workers * 32));
         tasks.spawn(async move {
-        let mut buf = vec![0u8; buf_len];
         // Consecutive transient receive failures (see `is_transient_udp_error`):
         // warn once when a burst starts, then stay quiet until it clears.
         let mut recv_failures: u64 = 0;
         loop {
+            let mut buf = pool.take();
             // `recv` reports the peer it came from; the client has exactly one
             // peer (the server), so the address is informational only — but the
             // *subflow* it arrived on is a usable distribution key.
-            let (n, _peer, shard) = match socket.recv_sharded(&mut buf).await {
+            let (n, _peer, shard) = match socket.recv_sharded(buf.as_mut_slice()).await {
                 Ok(v) => v,
                 // A transient path error (typically an ICMP unreachable queued
                 // on the connected socket) is retried, with a breather so a
@@ -776,8 +790,9 @@ async fn net_to_tun(
                 info!("receive path recovered after {recv_failures} transient error(s)");
                 recv_failures = 0;
             }
+            buf.set_len(n);
             let slot = shard % workers;
-            if txs[slot].send(buf[..n].to_vec()).await.is_err() {
+            if txs[slot].send(buf).await.is_err() {
                 return Ok(());
             }
         }
@@ -794,6 +809,8 @@ async fn net_to_tun(
         let assign_tx = assign_tx.clone();
         let peers = Arc::clone(&peers);
         let magic_suffix = magic_suffix.clone();
+        // Decrypted plaintext buffers, recycled per packet.
+        let pool = Arc::new(BufPool::new(MAX_IP_PACKET, 64, 256));
     tasks.spawn(async move {
         while let Some(pkt) = rx.recv().await {
             let n = pkt.len();
@@ -818,7 +835,7 @@ async fn net_to_tun(
 
             // Bad/forged/corrupt datagrams (too short or failing AEAD auth) are
             // dropped, not fatal — this is normal on an open UDP port.
-            let plaintext = match decrypt_packet(cipher, &master_key, datagram) {
+            let plaintext = match decrypt_into(&pool, cipher, &master_key, datagram) {
                 Ok(p) => p,
                 Err(e) => {
                     debug!("dropping undecryptable {n}-byte datagram: {e}");

@@ -22,8 +22,11 @@
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use rand::RngExt;
+
+use crate::bufpool::{Buf, BufPool};
 
 /// Destination Connection ID length, in bytes. Fixed and shared by both ends.
 pub const DEFAULT_DCID_LEN: usize = 8;
@@ -61,18 +64,39 @@ impl QuicObfs {
     }
 
     /// Prepend the QUIC short-header prefix to a finished crypto `datagram`.
-    pub fn wrap(&self, datagram: &[u8]) -> Vec<u8> {
+    /// Obfuscate into a buffer taken from `pool`, avoiding an allocation.
+    ///
+    /// The data-plane counterpart of [`QuicObfs::wrap`].
+    pub fn wrap_into(&self, pool: &Arc<BufPool>, datagram: &[u8]) -> Buf {
+        let mut buf = pool.take();
+        let n = self.wrap_slice(buf.as_mut_slice(), datagram);
+        buf.set_len(n);
+        buf
+    }
+
+    /// Core of [`QuicObfs::wrap`] / [`QuicObfs::wrap_into`]: write the framed
+    /// packet into `out` and return its length. `out` must be large enough.
+    pub fn wrap_slice(&self, out: &mut [u8], datagram: &[u8]) -> usize {
         let pn = self.pn.fetch_add(1, Ordering::Relaxed);
 
         let mut rnd = [0u8; 1];
         rand::rng().fill(rnd.as_mut_slice());
         let first = 0x40 | (rnd[0] & 0x3C) | ((PN_LEN as u8 - 1) & 0x03);
 
-        let mut out = Vec::with_capacity(self.header_len() + datagram.len());
-        out.push(first);
-        out.extend_from_slice(&self.dcid);
-        out.extend_from_slice(&pn.to_be_bytes()[4 - PN_LEN..]);
-        out.extend_from_slice(datagram);
+        let hdr = self.header_len();
+        let n = hdr + datagram.len();
+        assert!(out.len() >= n, "obfs buffer too small");
+        out[0] = first;
+        out[1..1 + self.dcid_len].copy_from_slice(&self.dcid);
+        out[1 + self.dcid_len..hdr].copy_from_slice(&pn.to_be_bytes()[4 - PN_LEN..]);
+        out[hdr..n].copy_from_slice(datagram);
+        n
+    }
+
+    pub fn wrap(&self, datagram: &[u8]) -> Vec<u8> {
+        let mut out = vec![0u8; self.header_len() + datagram.len()];
+        let n = self.wrap_slice(&mut out, datagram);
+        out.truncate(n);
         out
     }
 
@@ -121,6 +145,22 @@ impl Obfuscator {
         match self {
             Obfuscator::Quic(q) => q.wrap(datagram),
             Obfuscator::Base64 => base64_encode(datagram).into_bytes(),
+        }
+    }
+
+    /// Obfuscate into a pooled buffer; see [`QuicObfs::wrap_into`].
+    pub fn wrap_into(&self, pool: &Arc<BufPool>, datagram: &[u8]) -> Buf {
+        match self {
+            Obfuscator::Quic(q) => q.wrap_into(pool, datagram),
+            Obfuscator::Base64 => {
+                let mut buf = pool.take();
+                let encoded = base64_encode(datagram).as_bytes();
+                let n = encoded.len();
+                assert!(buf.as_mut_slice().len() >= n, "obfs buffer too small");
+                buf.as_mut_slice()[..n].copy_from_slice(encoded);
+                buf.set_len(n);
+                buf
+            }
         }
     }
 
