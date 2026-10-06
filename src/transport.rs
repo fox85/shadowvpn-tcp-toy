@@ -373,21 +373,24 @@ pub struct FlowHint {
 /// packet from one peer maps to the same shard, so a peer's packets stay on one
 /// worker and keep their order while different peers spread out.
 fn shard_of(peer: &SocketAddr) -> usize {
+    // FNV-1a. Mixed inline rather than collecting the address bytes first:
+    // `Ipv4Addr::octets()` is `[u8; 4]` but `Ipv6Addr::octets()` is `[u8; 16]`,
+    // so a `match` returning the bytes would not type-check — and the mixed
+    // version tag also keeps a V4 and a V6 address from ever colliding.
     let mut h: u64 = 0xcbf29ce484222325;
-    let bytes = match peer {
+    match peer {
         SocketAddr::V4(a) => {
-            h = (h ^ 4) ^ 0x9e3779b97f4a7c15;
-            h = h.wrapping_mul(0x100000001b3);
-            a.ip().octets()
+            h = (h ^ 4).wrapping_mul(0x100000001b3);
+            for b in a.ip().octets() {
+                h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+            }
         }
         SocketAddr::V6(a) => {
-            h = (h ^ 6) ^ 0x9e3779b97f4a7c15;
-            h = h.wrapping_mul(0x100000001b3);
-            a.ip().octets()
+            h = (h ^ 6).wrapping_mul(0x100000001b3);
+            for b in a.ip().octets() {
+                h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+            }
         }
-    };
-    for b in bytes {
-        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
     }
     h = (h ^ peer.port() as u64).wrapping_mul(0x100000001b3);
     h as usize
