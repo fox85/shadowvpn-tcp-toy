@@ -153,11 +153,14 @@ impl Obfuscator {
         match self {
             Obfuscator::Quic(q) => q.wrap_into(pool, datagram),
             Obfuscator::Base64 => {
+                // Bind the encoded `String` first: `as_bytes()` borrows from it,
+                // so a temporary would be dropped before we could copy it out.
+                let encoded = base64_encode(datagram);
+                let bytes = encoded.as_bytes();
+                let n = bytes.len();
                 let mut buf = pool.take();
-                let encoded = base64_encode(datagram).as_bytes();
-                let n = encoded.len();
                 assert!(buf.as_mut_slice().len() >= n, "obfs buffer too small");
-                buf.as_mut_slice()[..n].copy_from_slice(encoded);
+                buf.as_mut_slice()[..n].copy_from_slice(bytes);
                 buf.set_len(n);
                 buf
             }
