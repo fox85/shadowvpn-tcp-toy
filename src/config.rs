@@ -1285,7 +1285,7 @@ impl ServerArgs {
 
         let transport = resolve_transport(self.transport.or(file.transport))?;
         let padding = resolve_padding(self.padding.or(file.padding), transport)?;
-        let workers = shadowvpn::worker_count(self.workers.or(file.workers));
+        let workers = crate::worker_count(self.workers.or(file.workers));
 
         let (cipher, master_key) =
             resolve_crypto(self.cipher.or(file.cipher), self.password.or(file.password))?;
@@ -1399,7 +1399,7 @@ impl ClientArgs {
         let transport = resolve_transport(self.transport.or(file.transport))?;
         let subflows = resolve_subflows(self.subflows.or(file.subflows), transport)?;
         let padding = resolve_padding(self.padding.or(file.padding), transport)?;
-        let workers = shadowvpn::worker_count(self.workers.or(file.workers));
+        let workers = crate::worker_count(self.workers.or(file.workers));
 
         let (cipher, master_key) =
             resolve_crypto(self.cipher.or(file.cipher), self.password.or(file.password))?;
