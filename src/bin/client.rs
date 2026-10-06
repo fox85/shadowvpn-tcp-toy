@@ -46,7 +46,7 @@ use shadowvpn::crypto::{decrypt_packet, encrypt_packet, Cipher};
 use shadowvpn::magic::{apply_push, PeerTable};
 use shadowvpn::mesh::{self, Assign, AssignStatus, RouteInstaller};
 use shadowvpn::obfs::{self, Obfuscator};
-use shadowvpn::protocol::{max_datagram_size, max_tcp_frame_size, max_tcp_wire_size, MAX_IP_PACKET};
+use shadowvpn::protocol::{max_datagram_size, max_tcp_wire_size, MAX_IP_PACKET};
 use shadowvpn::state::{default_client_state_path, write_private};
 use shadowvpn::transport::{Transport, MAX_PADDING, MAX_TCP_FRAME};
 use shadowvpn::tun_device::{SubnetRouteGuard, TunDevice};
@@ -344,6 +344,7 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
     let (assign_tx, mut assign_rx) = mpsc::channel::<Assign>(8);
 
     // --- Relay + keepalive tasks -------------------------------------------
+    let workers = shadowvpn::worker_count(Some(cfg.workers));
     let mut up = tokio::spawn(tun_to_net(
         Arc::clone(&tun),
         Arc::clone(&socket),
@@ -352,6 +353,7 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
         obfuscator.clone(),
         Arc::clone(&assigned_ok),
         Arc::clone(&dns_slot),
+        workers,
     ));
 
     let mut down = tokio::spawn(net_to_tun(
@@ -364,6 +366,7 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
         cfg.auto_tun.then_some(assign_tx),
         Arc::clone(&peers),
         magic_suffix,
+        workers,
     ));
 
     // Static clients keep the 5-byte keepalive / RouteAdvert / NameAdvert tick.
@@ -561,8 +564,8 @@ async fn tun_to_net(
     obfuscator: Option<Arc<Obfuscator>>,
     assigned_ok: Arc<AtomicBool>,
     dns: DnsResolverSlot,
+    workers: usize,
 ) -> Result<()> {
-    let workers = shadowvpn::worker_count(Some(cfg.workers));
 
     // One channel per worker, dispatched on the inner 5-tuple hash: TUN hands
     // us plaintext, so the inner flow can be hashed directly. A given inner
@@ -724,11 +727,11 @@ async fn net_to_tun(
     assign_tx: Option<mpsc::Sender<Assign>>,
     peers: Arc<PeerTable>,
     magic_suffix: String,
+    workers: usize,
 ) -> Result<()> {
     // Fan out to several workers: decryption is per-packet CPU work, and one
     // task doing it serially caps throughput at roughly one core. Distributing
     // by subflow index keeps each worker's share stable.
-    let workers = shadowvpn::worker_count(Some(cfg.workers));
     let mut tasks = JoinSet::new();
     let mut txs = Vec::with_capacity(workers);
     let mut rxs = Vec::with_capacity(workers);
