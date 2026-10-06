@@ -254,11 +254,6 @@ pub struct FileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub padding: Option<usize>,
 
-    /// Packet-processing workers per direction. Overrides the CPU-derived
-    /// default; mainly a tuning/diagnostic knob.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub workers: Option<usize>,
-
     /// Carrier protocol: `"udp"` (default) or `"tcp"`. Must match the other end.
     ///
     /// With `"tcp"` the same frames are carried on a TCP stream, each prefixed
@@ -477,8 +472,6 @@ pub struct ServerConfig {
     /// Upper bound on random per-frame padding on the TCP carrier (0 disables).
     /// Must match the client: enabling it changes the frame layout.
     pub padding: usize,
-    /// Packet-processing workers per direction (AEAD + routing).
-    pub workers: usize,
     /// Negotiated AEAD cipher (`Cipher::None` disables encryption).
     pub cipher: Cipher,
     /// `EVP_BytesToKey`-derived master key (length == `cipher.key_len()`).
@@ -521,8 +514,6 @@ pub struct ClientConfig {
     /// Upper bound on random per-frame padding on the TCP carrier (0 disables).
     /// Ignored on UDP.
     pub padding: usize,
-    /// Packet-processing workers per direction (AEAD + DNS intercept).
-    pub workers: usize,
     /// Negotiated AEAD cipher (`Cipher::None` disables encryption).
     pub cipher: Cipher,
     /// `EVP_BytesToKey`-derived master key (length == `cipher.key_len()`).
@@ -587,12 +578,6 @@ pub struct ServerArgs {
     /// Must match the client: enabling it changes the frame layout.
     #[arg(long = "padding")]
     pub padding: Option<usize>,
-
-    /// Packet-processing workers per direction (default: derived from CPU
-    /// count). Raise it if AEAD is the bottleneck; lower it if the workers
-    /// mostly contend.
-    #[arg(long = "workers", value_name = "N")]
-    pub workers: Option<usize>,
 
     /// Explicit TUN interface name.
     #[arg(long = "tun-name")]
@@ -696,12 +681,6 @@ pub struct ClientArgs {
     /// (default DEFAULT_PADDING_MAX, 0 disables). Must match the other end.
     #[arg(long = "padding", value_name = "N")]
     pub padding: Option<usize>,
-
-    /// Packet-processing workers per direction (default: derived from CPU
-    /// count). Raise it if AEAD is the bottleneck; lower it if the workers
-    /// mostly contend.
-    #[arg(long = "workers", value_name = "N")]
-    pub workers: Option<usize>,
 
     /// Explicit TUN interface name.
     #[arg(long = "tun-name")]
@@ -1285,7 +1264,6 @@ impl ServerArgs {
 
         let transport = resolve_transport(self.transport.or(file.transport))?;
         let padding = resolve_padding(self.padding.or(file.padding), transport)?;
-        let workers = crate::worker_count(self.workers.or(file.workers));
 
         let (cipher, master_key) =
             resolve_crypto(self.cipher.or(file.cipher), self.password.or(file.password))?;
@@ -1364,7 +1342,6 @@ impl ServerArgs {
             listen,
             transport,
             padding,
-            workers,
             cipher,
             master_key,
             tun,
@@ -1399,7 +1376,6 @@ impl ClientArgs {
         let transport = resolve_transport(self.transport.or(file.transport))?;
         let subflows = resolve_subflows(self.subflows.or(file.subflows), transport)?;
         let padding = resolve_padding(self.padding.or(file.padding), transport)?;
-        let workers = crate::worker_count(self.workers.or(file.workers));
 
         let (cipher, master_key) =
             resolve_crypto(self.cipher.or(file.cipher), self.password.or(file.password))?;
@@ -1450,7 +1426,6 @@ impl ClientArgs {
             transport,
             subflows,
             padding,
-            workers,
             cipher,
             master_key,
             tun,
@@ -1563,7 +1538,6 @@ mod tests {
                 cipher: None,
                 transport: None,
                 padding: None,
-                workers: None,
                 tun_name: None,
                 tun_ip: None,
                 tun_netmask: None,
@@ -1605,7 +1579,6 @@ mod tests {
                 transport: None,
                 subflows: None,
                 padding: None,
-                workers: None,
                 tun_name: None,
                 tun_ip: None,
                 tun_netmask: None,
@@ -1645,7 +1618,6 @@ mod tests {
             cipher: Some("aes-128-gcm".to_string()),
             transport: None,
             padding: None,
-            workers: None,
             tun_name: Some("utun9".to_string()),
             tun_ip: Some(Ipv4Addr::new(10, 9, 0, 1)),
             tun_netmask: None,
@@ -2090,7 +2062,6 @@ mod tests {
             cipher: None,
             transport: None,
             padding: None,
-            workers: None,
             tun_name: None,
             tun_ip: Some(Ipv4Addr::new(10, 9, 0, 1)),
             tun_netmask: None,
@@ -2178,7 +2149,6 @@ mod tests {
             cipher: None,
             transport: None,
             padding: None,
-            workers: None,
             tun_name: None,
             tun_ip: Some(Ipv4Addr::new(10, 77, 0, 1)),
             tun_netmask: None,
