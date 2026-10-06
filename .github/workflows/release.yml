@@ -46,7 +46,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             rustflags: "-C target-feature=+aes,+neon"
           - target: armv7-unknown-linux-musleabihf
-            rustflags: "-C target-feature=+neon"
+            rustflags: "-C target-feature=+aes,+neon"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
