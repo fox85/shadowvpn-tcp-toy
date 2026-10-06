@@ -856,8 +856,11 @@ async fn net_to_tun(
                     Ok(Err(_)) | Err(_) => break,
                 }
             }
-            for (slot, batch) in fan_out(workers, batch) {
-                if txs[slot].send(batch).await.is_err() {
+            for (slot, group) in fan_out(workers, batch).into_iter().enumerate() {
+                if group.is_empty() {
+                    continue;
+                }
+                if txs[slot].send(group).await.is_err() {
                     return Ok(());
                 }
             }
@@ -878,7 +881,8 @@ async fn net_to_tun(
         // Decrypted plaintext buffers, recycled per packet.
         let pool = Arc::new(BufPool::new(MAX_IP_PACKET, 64, 256));
     tasks.spawn(async move {
-        let mut queue: Vec<Buf> = Vec::with_capacity(BATCH_MAX * 2);
+        // Each channel element is a batch of packets, so this holds batches.
+        let mut queue: Vec<Vec<Buf>> = Vec::with_capacity(BATCH_MAX * 2);
         loop {
             // One wakeup for up to BATCH_RECV hand-offs. Drain in arrival
             // order, then fall through to single-packet mode so batches of one
@@ -966,7 +970,6 @@ async fn net_to_tun(
             }
             }
         }
-        Ok(())
     });
     }
 
