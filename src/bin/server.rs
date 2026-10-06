@@ -38,6 +38,7 @@ use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
+use shadowvpn::batch::{fan_out, BATCH_MAX, BATCH_RECV, BATCH_SPIN};
 use shadowvpn::assign::{Assigner, Lease};
 use shadowvpn::config::{ServerArgs, ServerConfig};
 use shadowvpn::crypto::{decrypt_into, decrypt_packet, encrypt_into};
@@ -517,8 +518,9 @@ async fn udp_to_tun(
 
     // One channel per worker. The reader hashes each packet's shard key so a
     // peer's packets always land on the same worker and keep their order.
-    let mut txs: Vec<mpsc::Sender<(SocketAddr, Buf)>> = Vec::with_capacity(workers);
-    let mut rxs: Vec<mpsc::Receiver<(SocketAddr, Buf)>> = Vec::with_capacity(workers);
+    // Each channel element is a *batch*, so one wakeup retires many packets.
+    let mut txs: Vec<mpsc::Sender<Vec<(SocketAddr, Buf)>>> = Vec::with_capacity(workers);
+    let mut rxs: Vec<mpsc::Receiver<Vec<(SocketAddr, Buf)>>> = Vec::with_capacity(workers);
     for _ in 0..workers {
         // Per-worker depth: the total stays ~CHANNEL_DEPTH, so backpressure
         // still bounds memory the same way one big channel did.
@@ -542,17 +544,48 @@ async fn udp_to_tun(
             };
             let pool = Arc::new(BufPool::new(buf_len, workers * 4, workers * 32));
             loop {
-                // One buffer per packet, recycled: the hot path no longer
-                // allocates or copies.
+                // Block for the first packet: idle waiting costs nothing here.
                 let mut buf = pool.take();
                 let (n, peer, shard) = socket
                     .recv_sharded(buf.as_mut_slice())
                     .await
                     .with_context(|| format!("{} recv failed", socket.name()))?;
                 buf.set_len(n);
-                let slot = shard % workers;
-                if txs[slot].send((peer, buf)).await.is_err() {
-                    return Ok(()); // workers gone; nothing left to feed
+                let mut batch = vec![(shard, (peer, buf))];
+
+                // Then drain whatever else is already queued, up to a batch.
+                // Under load this fills instantly; when traffic is sparse the
+                // spin timeout ships the short batch almost immediately.
+                while batch.len() < BATCH_MAX {
+                    let mut extra = pool.take();
+                    match tokio::time::timeout(
+                        BATCH_SPIN,
+                        socket.recv_sharded(extra.as_mut_slice()),
+                    )
+                    .await
+                    {
+                        Ok(Ok((n, peer, shard))) => {
+                            extra.set_len(n);
+                            batch.push((shard, (peer, extra)));
+                        }
+                        Ok(Err(e)) => {
+                            return Err(e)
+                                .with_context(|| format!("{} recv failed", socket.name()))
+                        }
+                        Err(_) => break, // nothing more available right now
+                    }
+                }
+
+                for (slot, group) in fan_out(workers, batch)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if group.is_empty() {
+                        continue;
+                    }
+                    if txs[slot].send(group).await.is_err() {
+                        return Ok(()); // workers gone; nothing left to feed
+                    }
                 }
             }
         })
@@ -586,7 +619,23 @@ async fn udp_to_tun(
             256,
         ));
         tasks.spawn(async move {
-        while let Some((peer, pkt)) = rx.recv().await {
+        let mut batches: Vec<Vec<(SocketAddr, Buf)>> = Vec::with_capacity(BATCH_RECV);
+        // Flat drain buffer, reused every wakeup so it stops allocating.
+        let mut queue: Vec<(SocketAddr, Buf)> = Vec::new();
+        loop {
+            batches.clear();
+            // One wakeup, many batches, many packets: this is the point of
+            // batching — the channel no longer syncs per packet.
+            if rx.recv_many(&mut batches, BATCH_RECV).await == 0 {
+                return Ok(()); // reader gone
+            }
+            for b in batches.drain(..) {
+                queue.extend(b);
+            }
+            // `drain(..)` walks the queue front to back: order within a slot is
+            // preserved, which is what keeps a connection's packets in order.
+            // (`pop()` would reverse them.)
+        for (peer, pkt) in queue.drain(..) {
             let n = pkt.len();
 
             // De-obfuscate when enabled; a packet that doesn't match the configured
@@ -744,7 +793,7 @@ async fn udp_to_tun(
                 }
             }
         }
-        Ok(())
+        }
     });
     }
 
@@ -779,8 +828,8 @@ async fn tun_to_udp(
     // directly — and spreading it is what lets several cores do the AEAD work.
     // A given inner connection always hashes to the same worker, so it keeps
     // its order.
-    let mut txs: Vec<mpsc::Sender<Buf>> = Vec::with_capacity(workers);
-    let mut rxs: Vec<mpsc::Receiver<Buf>> = Vec::with_capacity(workers);
+    let mut txs: Vec<mpsc::Sender<Vec<Buf>>> = Vec::with_capacity(workers);
+    let mut rxs: Vec<mpsc::Receiver<Vec<Buf>>> = Vec::with_capacity(workers);
     for _ in 0..workers {
         let (tx, rx) = mpsc::channel(CHANNEL_DEPTH / workers + 64);
         txs.push(tx);
@@ -802,8 +851,32 @@ async fn tun_to_udp(
                     .context("failed to read from TUN")?;
                 buf.set_len(n);
                 let slot = shadowvpn::transport::classify(&buf).hash as usize % workers;
-                if txs[slot].send(buf).await.is_err() {
-                    return Ok(());
+                let mut batch = vec![(slot, buf)];
+
+                // Drain whatever else the device already has queued.
+                while batch.len() < BATCH_MAX {
+                    let mut extra = pool.take();
+                    match tokio::time::timeout(BATCH_SPIN, tun.recv(extra.as_mut_slice())).await {
+                        Ok(Ok(n)) => {
+                            extra.set_len(n);
+                            let s = shadowvpn::transport::classify(&extra).hash as usize % workers;
+                            batch.push((s, extra));
+                        }
+                        Ok(Err(e)) => return Err(e).context("failed to read from TUN"),
+                        Err(_) => break,
+                    }
+                }
+
+                for (slot, group) in fan_out(workers, batch)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if group.is_empty() {
+                        continue;
+                    }
+                    if txs[slot].send(group).await.is_err() {
+                        return Ok(());
+                    }
                 }
             }
         });
@@ -821,7 +894,17 @@ async fn tun_to_udp(
             256,
         ));
         tasks.spawn(async move {
-        while let Some(mut pkt) = rx.recv().await {
+        let mut batches: Vec<Vec<Buf>> = Vec::with_capacity(BATCH_RECV);
+        let mut queue: Vec<Buf> = Vec::new();
+        loop {
+            batches.clear();
+            if rx.recv_many(&mut batches, BATCH_RECV).await == 0 {
+                return Ok(());
+            }
+            for b in batches.drain(..) {
+                queue.extend(b);
+            }
+        for mut pkt in queue.drain(..) {
             let n = pkt.len();
             let now = Instant::now();
 
@@ -878,7 +961,7 @@ async fn tun_to_udp(
                 warn!("failed to send datagram to {peer}: {err}");
             }
         }
-        Ok(())
+        }
     });
     }
 

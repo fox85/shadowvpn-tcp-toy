@@ -404,6 +404,70 @@ sysctl -w net.core.default_qdisc=fq
 
 `iperf3 -P 8` 测聚合（单流只能吃到一条子流）。启动日志若有窗口告警，按提示调 sysctl。
 
+## 批量 I/O：摊薄每次 hand-off 的固定成本
+
+### 先说清楚：批量能省什么、不能省什么
+
+零拷贝消除了分配和拷贝，收益却很少，说明剩下的固定成本在别处。批量 I/O 针对的是
+**通道 hand-off 与 reactor 往返**：
+
+* 原来每包一次 `send` + 一次 `recv` ⇒ 每包两次原子操作 + 两次可能的任务唤醒
+* 改成每批一次 ⇒ 同样的工作量被 8–32 个包摊薄
+
+**但必须诚实**：TUN 设备 `read()` 一次只返回一个包，`writev` 会把多个 iovec 拼成
+**一个**包——所以 **TUN 侧 syscall 数量无法通过批量减少**。socket 侧同理（除非用
+`recvmmsg`/`sendmmsg`，tokio 未暴露）。本次收益来自 hand-off 与唤醒，不是 syscall。
+
+### 新增 `src/batch.rs`
+
+* `BATCH_MAX = 32` —— reader 一次攒多少包
+* `BATCH_SPIN = 50 µs` —— 攒批窗口。有负载时瞬间填满；空闲时几乎立刻发出短批，
+  不会因为等满一批而增加延迟
+* `BATCH_RECV = 8` —— worker 一次 `recv_many` 取多少批
+* `fan_out(slots, batch)` —— 按目标 slot 分组，一次 send 送一批，避免同一 worker
+  被连续唤醒多次
+
+### 攒批方式（关键设计）
+
+**首包阻塞 await，其余用 `timeout(BATCH_SPIN)` 补货**：
+
+```rust
+let (n, peer, shard) = socket.recv_sharded(buf.as_mut_slice()).await?;  // 阻塞等首包
+while batch.len() < BATCH_MAX {
+    let mut extra = pool.take();
+    let r = tokio::time::timeout(BATCH_SPIN, socket.recv_sharded(extra.as_mut_slice())).await;
+    match r { Ok(Ok(..)) => batch.push(..), Ok(Err(e)) => return Err(e), Err(_) => break }
+}
+```
+
+空转时没有额外延迟（首包一到就走补货循环，50 µs 内超时发出）；有负载时批量自然填满。
+
+`timeout` 的结果必须先 `let` 绑定再 `match`——直接在 `match` 的 scrutinee 里
+`.await` 会让 future 存活到整个 match 结束，从而**一直借用着 `extra`**，导致无法
+把它 move 进 batch（E0505）。这是本次实现最容易踩的坑。
+
+被取消的读不会丢数据：tokio 只有在非阻塞 `try_read` 已失败后才会注册 reactor
+等待，取消只是撤销注册。
+
+### worker 侧
+
+`rx.recv_many(&mut queue, BATCH_RECV)` 一次唤醒取最多 8 批，然后
+`for batch in queue.drain(..)` **按到达顺序**处理。
+
+这里必须用 `drain(..)` 而不是 `while let Some(x) = queue.pop()`：`pop()` 从尾部取，
+会把批次顺序**倒过来**，破坏包序。
+
+### 改动的四条路径
+
+| 位置 | 入站/出站 | 通道元素 |
+| --- | --- | --- |
+| server carrier→TUN | 入站 | `Vec<(SocketAddr, Buf)>` |
+| server TUN→carrier | 出站 | `Vec<Buf>` |
+| client TUN→net | 出站 | `Vec<Buf>` |
+| client net→TUN | 入站 | `Vec<Buf>` |
+
+按 shard（入站）或内层 5 元组 hash（出站）分组后 `fan_out` 分发，包序保持。
+
 ## 零拷贝重构：消除热路径上的每包堆分配
 
 ### 为什么做这个

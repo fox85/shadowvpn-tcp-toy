@@ -118,6 +118,7 @@
 #![warn(missing_docs)]
 
 pub mod assign;
+pub mod batch;
 pub mod bufpool;
 pub mod config;
 pub mod crypto;

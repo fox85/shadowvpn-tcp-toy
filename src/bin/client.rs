@@ -41,6 +41,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
+use shadowvpn::batch::{fan_out, BATCH_MAX, BATCH_RECV, BATCH_SPIN};
 use shadowvpn::config::{ClientArgs, ClientConfig, TunConfig};
 use shadowvpn::crypto::{decrypt_into, encrypt_into, encrypt_packet, Cipher};
 use shadowvpn::magic::{apply_push, PeerTable};
@@ -571,8 +572,9 @@ async fn tun_to_net(
     // One channel per worker, dispatched on the inner 5-tuple hash: TUN hands
     // us plaintext, so the inner flow can be hashed directly. A given inner
     // connection always lands on the same worker, so it keeps its order.
-    let mut txs: Vec<mpsc::Sender<Buf>> = Vec::with_capacity(workers);
-    let mut rxs: Vec<mpsc::Receiver<Buf>> = Vec::with_capacity(workers);
+    // Each element is a *batch*, so one wakeup retires many packets.
+    let mut txs: Vec<mpsc::Sender<Vec<Buf>>> = Vec::with_capacity(workers);
+    let mut rxs: Vec<mpsc::Receiver<Vec<Buf>>> = Vec::with_capacity(workers);
     for _ in 0..workers {
         let (tx, rx) = mpsc::channel(CHANNEL_DEPTH / workers + 64);
         txs.push(tx);
@@ -604,8 +606,41 @@ async fn tun_to_net(
                 continue;
             }
             let slot = shadowvpn::transport::classify(&buf).hash as usize % workers;
-            if txs[slot].send(buf).await.is_err() {
-                return Ok(());
+            let mut batch = vec![(slot, buf)];
+
+            // Drain whatever else the device already has queued.
+            while batch.len() < BATCH_MAX {
+                let mut extra = pool.take();
+                let r = tokio::time::timeout(BATCH_SPIN, tun_reader.recv(extra.as_mut_slice()))
+                    .await;
+                match r {
+                    Ok(Ok(n)) => {
+                        if n == 0 {
+                            continue;
+                        }
+                        extra.set_len(n);
+                        if !assigned_ok.load(Ordering::Acquire) {
+                            continue;
+                        }
+                        let slot =
+                            shadowvpn::transport::classify(&extra).hash as usize % workers;
+                        batch.push((slot, extra));
+                    }
+                    Ok(Err(e)) => return Err(e).context("failed to read from TUN device"),
+                    Err(_) => break,
+                }
+            }
+
+            for (slot, group) in fan_out(workers, batch)
+                .into_iter()
+                .enumerate()
+            {
+                if group.is_empty() {
+                    continue;
+                }
+                if txs[slot].send(group).await.is_err() {
+                    return Ok(());
+                }
             }
         }
     });
@@ -629,7 +664,17 @@ async fn tun_to_net(
         // Consecutive transient send failures (see `is_transient_udp_error`):
         // warn once when a burst starts, then stay quiet until it clears.
         let mut send_failures: u64 = 0;
-        while let Some(pkt) = rx.recv().await {
+        let mut batches: Vec<Vec<Buf>> = Vec::with_capacity(BATCH_RECV);
+        let mut queue: Vec<Buf> = Vec::new();
+        loop {
+            batches.clear();
+            if rx.recv_many(&mut batches, BATCH_RECV).await == 0 {
+                return Ok(());
+            }
+            for b in batches.drain(..) {
+                queue.extend(b);
+            }
+        for pkt in queue.drain(..) {
             // User-mode DNS intercept: IPv4 UDP/53 is answered by the split-DNS
             // / Magic DNS resolver and written back to TUN, never encrypted.
             // The resolver's own tunneled upstream queries (tracked by source
@@ -705,7 +750,7 @@ async fn tun_to_net(
                 wire.len()
             );
         }
-        Ok(())
+        }
     });
     }
 
@@ -743,8 +788,8 @@ async fn net_to_tun(
     // task doing it serially caps throughput at roughly one core. Distributing
     // by subflow index keeps each worker's share stable.
     let mut tasks = JoinSet::new();
-    let mut txs: Vec<mpsc::Sender<Buf>> = Vec::with_capacity(workers);
-    let mut rxs: Vec<mpsc::Receiver<Buf>> = Vec::with_capacity(workers);
+    let mut txs: Vec<mpsc::Sender<Vec<Buf>>> = Vec::with_capacity(workers);
+    let mut rxs: Vec<mpsc::Receiver<Vec<Buf>>> = Vec::with_capacity(workers);
     for _ in 0..workers {
         let (tx, rx) = mpsc::channel(CHANNEL_DEPTH / workers + 64);
         txs.push(tx);
@@ -765,10 +810,10 @@ async fn net_to_tun(
         // warn once when a burst starts, then stay quiet until it clears.
         let mut recv_failures: u64 = 0;
         loop {
+            // Batch: block for the first frame, then top up without waiting so
+            // a burst moves as one hand-off instead of one wakeup per packet.
+            let mut batch: Vec<(usize, Buf)> = Vec::with_capacity(BATCH_MAX);
             let mut buf = pool.take();
-            // `recv` reports the peer it came from; the client has exactly one
-            // peer (the server), so the address is informational only — but the
-            // *subflow* it arrived on is a usable distribution key.
             let (n, _peer, shard) = match socket.recv_sharded(buf.as_mut_slice()).await {
                 Ok(v) => v,
                 // A transient path error (typically an ICMP unreachable queued
@@ -791,9 +836,30 @@ async fn net_to_tun(
                 recv_failures = 0;
             }
             buf.set_len(n);
-            let slot = shard % workers;
-            if txs[slot].send(buf).await.is_err() {
-                return Ok(());
+            batch.push((shard % workers, buf));
+            // Top up without blocking. The future is dropped by the end of the
+            // `let`, which releases the borrow of `b` — so `b` can be moved
+            // into the batch (or returned to the pool) below.
+            while batch.len() < BATCH_MAX {
+                let mut b = pool.take();
+                let ready = tokio::time::timeout(BATCH_SPIN, socket.recv_sharded(b.as_mut_slice()))
+                    .await;
+                match ready {
+                    Ok(Ok((n, _peer, shard))) => {
+                        b.set_len(n);
+                        batch.push((shard % workers, b));
+                    }
+                    // Timeout (`Err`) or a real error: drop `b` back to the
+                    // pool and hand over whatever we got. A cancelled read
+                    // loses nothing — tokio only registers for readiness once
+                    // a non-blocking try_read has already failed.
+                    Ok(Err(_)) | Err(_) => break,
+                }
+            }
+            for (slot, batch) in fan_out(workers, batch) {
+                if txs[slot].send(batch).await.is_err() {
+                    return Ok(());
+                }
             }
         }
         });
@@ -812,7 +878,16 @@ async fn net_to_tun(
         // Decrypted plaintext buffers, recycled per packet.
         let pool = Arc::new(BufPool::new(MAX_IP_PACKET, 64, 256));
     tasks.spawn(async move {
-        while let Some(pkt) = rx.recv().await {
+        let mut queue: Vec<Buf> = Vec::with_capacity(BATCH_MAX * 2);
+        loop {
+            // One wakeup for up to BATCH_RECV hand-offs. Drain in arrival
+            // order, then fall through to single-packet mode so batches of one
+            // cost nothing extra.
+            if rx.recv_many(&mut queue, BATCH_RECV).await == 0 {
+                return Ok(());
+            }
+            for batch in queue.drain(..) {
+            for pkt in batch {
             let n = pkt.len();
 
             // De-obfuscate (if enabled); a packet that doesn't match the configured
@@ -888,6 +963,8 @@ async fn net_to_tun(
                 "net->tun: {n} bytes datagram -> {} bytes plaintext",
                 plaintext.len()
             );
+            }
+            }
         }
         Ok(())
     });
