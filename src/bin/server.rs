@@ -36,6 +36,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
+use tokio::task::JoinSet;
 
 use shadowvpn::assign::{Assigner, Lease};
 use shadowvpn::config::{ServerArgs, ServerConfig};
@@ -472,35 +473,65 @@ async fn udp_to_tun(
     obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
     let cipher = cfg.cipher;
-    let (tx, mut rx) = mpsc::channel::<(SocketAddr, Vec<u8>)>(CHANNEL_DEPTH);
+    let workers = shadowvpn::worker_count();
 
-    // The processor sends too (mesh relays + route pushes), so it keeps its
-    // own handle on the socket while the reader owns the other.
-    let socket_out = Arc::clone(&socket);
+    // One channel per worker. The reader hashes each packet's shard key so a
+    // peer's packets always land on the same worker and keep their order.
+    let mut txs: Vec<mpsc::Sender<(SocketAddr, Vec<u8>)>> = Vec::with_capacity(workers);
+    let mut rxs: Vec<mpsc::Receiver<(SocketAddr, Vec<u8>)>> = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        // Per-worker depth: the total stays ~CHANNEL_DEPTH, so backpressure
+        // still bounds memory the same way one big channel did.
+        let (tx, rx) = mpsc::channel(CHANNEL_DEPTH / workers + 64);
+        txs.push(tx);
+        rxs.push(rx);
+    }
+    let workers = txs.len();
 
-    // Reader: pull datagrams off the wire and hand each to the processor.
-    let reader = tokio::spawn(async move {
-        // Extra headroom for the obfs prefix on top of the largest crypto
-        // datagram; TCP additionally needs room for the length prefix.
-        let buf_len = if socket.is_tcp() {
-            max_tcp_frame_size(cipher) + obfs::MAX_HEADER
-        } else {
-            max_datagram_size(cipher) + obfs::MAX_HEADER
-        };
-        let mut buf = vec![0u8; buf_len];
-        loop {
-            let (n, peer) = socket
-                .recv(&mut buf)
-                .await
-                .with_context(|| format!("{} recv failed", socket.name()))?;
-            if tx.send((peer, buf[..n].to_vec())).await.is_err() {
-                return Ok(()); // processor gone; nothing left to feed
+    // Reader: pull datagrams off the wire and dispatch each to a worker.
+    let mut tasks = JoinSet::new();
+    {
+        let socket = Arc::clone(&socket);
+        tasks.spawn(async move {
+            // Extra headroom for the obfs prefix on top of the largest crypto
+            // datagram; TCP additionally needs room for the length prefix.
+            let buf_len = if socket.is_tcp() {
+                max_tcp_frame_size(cipher) + obfs::MAX_HEADER
+            } else {
+                max_datagram_size(cipher) + obfs::MAX_HEADER
+            };
+            let mut buf = vec![0u8; buf_len];
+            loop {
+                let (n, peer, shard) = socket
+                    .recv_sharded(&mut buf)
+                    .await
+                    .with_context(|| format!("{} recv failed", socket.name()))?;
+                let slot = shard % workers;
+                if txs[slot].send((peer, buf[..n].to_vec())).await.is_err() {
+                    return Ok(()); // workers gone; nothing left to feed
+                }
             }
-        }
-    });
+        })
+    };
 
-    // Processor: de-obfuscate, decrypt, route/rewrite, write to TUN.
-    let processor = tokio::spawn(async move {
+    // Workers: de-obfuscate, decrypt, route/rewrite, write to TUN.
+    //
+    // The AEAD work was the bottleneck: one task doing every packet's decrypt
+    // caps throughput at a single core no matter how many subflows feed it.
+    // Spreading it over `workers` tasks keeps each inner connection ordered
+    // (the shard key is stable per peer, so its packets always land on the
+    // same worker) while using several cores.
+    //
+    // Each worker owns its clones of the shared state; all of it is already
+    // behind a `Mutex`/`RwLock`, so this needs no extra synchronisation.
+    let socket_out = Arc::clone(&socket);
+    for mut rx in rxs {
+        let socket_out = Arc::clone(&socket_out);
+        let obfuscator = obfuscator.clone();
+        let cfg = Arc::clone(&cfg);
+        let routing = Arc::clone(&routing);
+        let tun = Arc::clone(&tun);
+        tasks.spawn(async move {
         while let Some((peer, pkt)) = rx.recv().await {
             let n = pkt.len();
 
@@ -650,13 +681,16 @@ async fn udp_to_tun(
         }
         Ok(())
     });
+    }
 
-    // First task to finish (only on a fatal error) ends the loop; abort the other.
-    let mut reader = reader;
-    let mut processor = processor;
-    tokio::select! {
-        r = &mut reader => { processor.abort(); r.context("UDP→TUN reader task panicked")? }
-        r = &mut processor => { reader.abort(); r.context("UDP→TUN processor task panicked")? }
+    // First task to finish (only on a fatal error) ends the loop; abort the rest.
+    match tasks.join_next().await {
+        None => Ok(()),
+        Some(Err(e)) => Err(e).context("UDP→TUN task panicked"),
+        Some(Ok(r)) => {
+            tasks.abort_all();
+            r
+        }
     }
 }
 
@@ -673,24 +707,48 @@ async fn tun_to_udp(
     obfuscator: Option<Arc<Obfuscator>>,
 ) -> Result<()> {
     let cipher = cfg.cipher;
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(CHANNEL_DEPTH);
+    let workers = shadowvpn::worker_count();
 
-    // Reader: pull IP packets off the TUN device and hand each to the processor.
-    let reader = tokio::spawn(async move {
-        let mut buf = vec![0u8; MAX_IP_PACKET];
-        loop {
-            let n = tun
-                .recv(&mut buf)
-                .await
-                .context("failed to read from TUN")?;
-            if tx.send(buf[..n].to_vec()).await.is_err() {
-                return Ok(());
+    // One channel per worker, dispatched on the inner 5-tuple hash. TUN hands
+    // us plaintext, so this is the one place the inner flow can be hashed
+    // directly — and spreading it is what lets several cores do the AEAD work.
+    // A given inner connection always hashes to the same worker, so it keeps
+    // its order.
+    let mut txs: Vec<mpsc::Sender<Vec<u8>>> = Vec::with_capacity(workers);
+    let mut rxs: Vec<mpsc::Receiver<Vec<u8>>> = Vec::with_capacity(workers);
+    for _ in 0..workers {
+        let (tx, rx) = mpsc::channel(CHANNEL_DEPTH / workers + 64);
+        txs.push(tx);
+        rxs.push(rx);
+    }
+    let workers = txs.len();
+
+    // Reader: pull IP packets off the TUN device and dispatch each to a worker.
+    let mut tasks = JoinSet::new();
+    {
+        let tun = Arc::clone(&tun);
+        tasks.spawn(async move {
+            let mut buf = vec![0u8; MAX_IP_PACKET];
+            loop {
+                let n = tun
+                    .recv(&mut buf)
+                    .await
+                    .context("failed to read from TUN")?;
+                let slot = shadowvpn::transport::classify(&buf[..n]).hash as usize % workers;
+                if txs[slot].send(buf[..n].to_vec()).await.is_err() {
+                    return Ok(());
+                }
             }
-        }
-    });
+        });
+    }
 
-    // Processor: resolve/rewrite the destination, encrypt, obfuscate, send.
-    let processor = tokio::spawn(async move {
+    // Workers: resolve/rewrite the destination, encrypt, obfuscate, send.
+    for mut rx in rxs {
+        let socket = Arc::clone(&socket);
+        let obfuscator = obfuscator.clone();
+        let cfg = Arc::clone(&cfg);
+        let routing = Arc::clone(&routing);
+        tasks.spawn(async move {
         while let Some(mut pkt) = rx.recv().await {
             let n = pkt.len();
             let now = Instant::now();
@@ -750,12 +808,15 @@ async fn tun_to_udp(
         }
         Ok(())
     });
+    }
 
-    let mut reader = reader;
-    let mut processor = processor;
-    tokio::select! {
-        r = &mut reader => { processor.abort(); r.context("TUN→UDP reader task panicked")? }
-        r = &mut processor => { reader.abort(); r.context("TUN→UDP processor task panicked")? }
+    match tasks.join_next().await {
+        None => Ok(()),
+        Some(Err(e)) => Err(e).context("TUN→UDP task panicked"),
+        Some(Ok(r)) => {
+            tasks.abort_all();
+            r
+        }
     }
 }
 

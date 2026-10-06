@@ -47,7 +47,11 @@ pub const TCP_RCVBUF_BYTES: usize = 4 * 1024 * 1024;
 /// Requested size, in bytes, for each TCP subflow's **send** buffer.
 ///
 /// Bounds how much unacknowledged data a subflow may have in flight, so it
-/// caps throughput the same way the receive window does — from the other end.
+/// caps throughput the same way the receive window does — from the other end:
+/// a subflow cannot move faster than `send_window / RTT` either.
+///
+/// 4 MiB matches the receive side, so neither end of one connection is the
+/// narrower pipe.
 pub const TCP_SNDBUF_BYTES: usize = 4 * 1024 * 1024;
 
 /// Congestion-control algorithm requested for the outer TCP connections.
@@ -158,8 +162,17 @@ fn get_opt_u32(fd: libc::c_int, opt: libc::c_int) -> Option<u32> {
 /// **set nothing at all** and let auto-tuning do its job, which is far better
 /// than a locked 208 KiB window.
 ///
-/// The send buffer has no equivalent auto-tuning to lose, so a clamped value
-/// is still an improvement and the plain option is fine as a fallback.
+/// **The send side is symmetric to the receive side** — and for a while this
+/// function got it wrong in exactly the way the doc comment above warns about.
+/// `SO_SNDBUF` is clamped to `net.core.wmem_max` (208 KiB by default) *and*
+/// sets `SOCK_SNDBUF_LOCK`, which disables the kernel's send-buffer
+/// auto-tuning. So the old "no auto-tuning to lose, take whatever the kernel
+/// allows" fallback locked the send window at ~208 KiB: on a 66 ms path that
+/// is ~25 Mbit/s per subflow, i.e. ~100 Mbit/s across four subflows no matter
+/// how fast the link is.
+///
+/// So: `SO_SNDBUFFORCE` or nothing. Auto-tuning (bounded by
+/// `net.ipv4.tcp_wmem[2]`, 4 MiB by default) beats a locked, clamped window.
 #[cfg(target_os = "linux")]
 fn apply_tcp_buffers(fd: libc::c_int) {
     let rcv_ok = set_opt_u32(fd, linux_tcp::SO_RCVBUFFORCE, TCP_RCVBUF_BYTES as u32);
@@ -170,13 +183,22 @@ fn apply_tcp_buffers(fd: libc::c_int) {
         // Auto-tuning (bounded by net.ipv4.tcp_rmem[2], 6 MiB by default) beats
         // a locked, clamped window by an order of magnitude.
         log::debug!(
-            "could not force SO_RCVBUF to {} bytes (needs CAP_NET_ADMIN);              leaving it unset so TCP window auto-tuning stays active.              For very long RTT paths raise net.core.rmem_max and net.ipv4.tcp_rmem",
+            "could not force SO_RCVBUF to {} bytes (needs CAP_NET_ADMIN); \
+             leaving it unset so TCP window auto-tuning stays active. \
+             For very long RTT paths raise net.core.rmem_max and net.ipv4.tcp_rmem",
             TCP_RCVBUF_BYTES
         );
     }
     if !snd_ok {
-        // No auto-tuning to lose here, so take whatever the kernel allows.
-        let _ = set_opt_u32(fd, libc::SO_SNDBUF, TCP_SNDBUF_BYTES as u32);
+        // Deliberately NOT falling back to SO_SNDBUF either: same trap as
+        // above (clamped to wmem_max *and* locks auto-tuning). Auto-tuning,
+        // bounded by net.ipv4.tcp_wmem[2] (4 MiB by default), is far better.
+        log::debug!(
+            "could not force SO_SNDBUF to {} bytes (needs CAP_NET_ADMIN); \
+             leaving it unset so TCP send-buffer auto-tuning stays active. \
+             For very long RTT paths raise net.core.wmem_max and net.ipv4.tcp_wmem",
+            TCP_SNDBUF_BYTES
+        );
     }
 
     // Report what actually took effect — the number that bounds throughput.
@@ -190,8 +212,25 @@ fn apply_tcp_buffers(fd: libc::c_int) {
                  this caps a single subflow at roughly {} Mbit/s per 100 ms of RTT. \
                  Raise net.core.rmem_max / net.ipv4.tcp_rmem, or run as root so \
                  SO_RCVBUFFORCE can bypass the limit",
+            effective / 1024,
+            TCP_RCVBUF_BYTES / 1024,
+            mbit_at_100ms
+        );
+        }
+    }
+
+    // Same for the send side: sk_sndbuf is likewise reported as 2x.
+    if let Some(got) = get_opt_u32(fd, libc::SO_SNDBUF) {
+        let effective = got / 2;
+        if effective < TCP_SNDBUF_BYTES as u32 {
+            let mbit_at_100ms = (got as u64 * 8) / 100_000;
+            log::warn!(
+                "TCP send window is only ~{} KiB (asked for {} KiB); \
+                 this caps a single subflow at roughly {} Mbit/s per 100 ms of RTT. \
+                 Raise net.core.wmem_max / net.ipv4.tcp_wmem, or run as root so \
+                 SO_SNDBUFFORCE can bypass the limit",
                 effective / 1024,
-                TCP_RCVBUF_BYTES / 1024,
+                TCP_SNDBUF_BYTES / 1024,
                 mbit_at_100ms
             );
         }

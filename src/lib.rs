@@ -133,3 +133,26 @@ pub mod state;
 pub mod tun_device;
 #[cfg(feature = "uri")]
 pub mod uri;
+
+/// How many packet-processing workers to run per direction.
+///
+/// ## Why this exists
+///
+/// Once the TCP windows are large enough that the link is no longer the limit,
+/// throughput is set by **one task doing AEAD per packet**. A single core's
+/// AEAD throughput (plus the per-packet TUN syscall) is well under a gigabit,
+/// so a 500 Mbit/s target needs the crypto spread over several cores.
+///
+/// Packets are dispatched by a stable shard key (see
+/// [`transport::Transport::recv_sharded`]), so everything that must stay
+/// ordered — one subflow, or one peer's packets — lands on one worker and keeps
+/// its order, while unrelated sources run in parallel.
+///
+/// Sized from the machine: enough workers to matter on a big box, but capped
+/// because beyond a handful the shared routing/NAT state becomes the
+/// contention rather than the crypto.
+pub fn worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 8))
+        .unwrap_or(4)
+}

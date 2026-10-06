@@ -366,6 +366,33 @@ pub struct FlowHint {
     pub ordered: bool,
 }
 
+/// Stable shard key for a peer address, used to spread connections across
+/// worker tasks.
+///
+/// Any stable function of the peer works: the only requirement is that every
+/// packet from one peer maps to the same shard, so a peer's packets stay on one
+/// worker and keep their order while different peers spread out.
+fn shard_of(peer: &SocketAddr) -> usize {
+    let mut h: u64 = 0xcbf29ce484222325;
+    let bytes = match peer {
+        SocketAddr::V4(a) => {
+            h = (h ^ 4) ^ 0x9e3779b97f4a7c15;
+            h = h.wrapping_mul(0x100000001b3);
+            a.ip().octets()
+        }
+        SocketAddr::V6(a) => {
+            h = (h ^ 6) ^ 0x9e3779b97f4a7c15;
+            h = h.wrapping_mul(0x100000001b3);
+            a.ip().octets()
+        }
+    };
+    for b in bytes {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    h = (h ^ peer.port() as u64).wrapping_mul(0x100000001b3);
+    h as usize
+}
+
 /// Classify an IP packet for subflow scheduling: hash its 5-tuple and say
 /// whether it needs ordered delivery.
 ///
@@ -1125,6 +1152,16 @@ impl TcpHub {
 
     /// Receive the next frame from any connection.
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.recv_shard(buf).await.map(|(n, peer, _)| (n, peer))
+    }
+
+    /// Receive the next frame, also reporting a stable "which connection" tag.
+    ///
+    /// See [`Transport::recv_sharded`] for what the index is for.
+    async fn recv_shard(
+        &self,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, SocketAddr, usize)> {
         let mut inbound = self.inbound.lock().await;
         let (peer, payload) = inbound.recv().await.ok_or_else(|| {
             std::io::Error::new(
@@ -1134,7 +1171,7 @@ impl TcpHub {
         })?;
         let n = payload.len().min(buf.len());
         buf[..n].copy_from_slice(&payload[..n]);
-        Ok((n, peer))
+        Ok((n, peer, shard_of(&peer)))
     }
 
     /// Tear down `peer`'s connection immediately, emitting a TCP RST.
@@ -1231,8 +1268,16 @@ pub struct TcpClient {
     /// direct/domestic DNS to this address, so it must stay stable across
     /// reconnects — a rebinding would silently change the physical source IP.
     local: Option<SocketAddr>,
-    /// Frames received from the server, across every subflow and reconnect.
-    inbound: Mutex<mpsc::Receiver<Vec<u8>>>,
+    /// Frames received from the server, across every subflow and reconnect,
+    /// each tagged with the **index of the subflow it arrived on**.
+    ///
+    /// The tag is what lets the caller shard packets across worker tasks: every
+    /// packet from one subflow carries the same index, so hashing it keeps that
+    /// subflow's packets on one worker and therefore in order, while different
+    /// subflows spread out. Without the tag a client could only ever use one
+    /// worker — all its frames arrive from a single server address, so there
+    /// would be nothing to hash on.
+    inbound: Mutex<mpsc::Receiver<(usize, Vec<u8>)>>,
     /// Writer handle per subflow; `None` while that subflow is reconnecting.
     outbound: Slots,
     /// Number of parallel connections this client maintains.
@@ -1262,7 +1307,7 @@ impl TcpClient {
         let mut local = None;
 
         for idx in 0..subflows {
-            let (tx, addr, reader) = Self::dial(server, &inbound_tx, opts.clone()).await?;
+            let (tx, addr, reader) = Self::dial(server, idx, &inbound_tx, opts.clone()).await?;
             if idx == 0 {
                 local = addr;
             }
@@ -1301,7 +1346,8 @@ impl TcpClient {
     /// resolves when the connection ends).
     async fn dial(
         server: SocketAddr,
-        inbound_tx: &mpsc::Sender<Vec<u8>>,
+        idx: usize,
+        inbound_tx: &mpsc::Sender<(usize, Vec<u8>)>,
         opts: TcpOptions,
     ) -> std::io::Result<(
         mpsc::Sender<Vec<u8>>,
@@ -1332,15 +1378,31 @@ impl TcpClient {
         ));
 
         let tx = inbound_tx.clone();
-        let reader_task = tokio::spawn(tcp_read_loop(reader, tx, |p| p, opts, abort));
+        let reader_task = tokio::spawn(tcp_read_loop(
+            reader,
+            tx,
+            move |p| (idx, p),
+            opts,
+            abort,
+        ));
 
         Ok((out_tx, local, reader_task))
     }
 
     /// Receive the next frame from the server.
     async fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        self.recv_shard(buf).await.map(|(n, peer, _)| (n, peer))
+    }
+
+    /// Receive the next frame, also reporting which subflow it arrived on.
+    ///
+    /// See [`Transport::recv_sharded`] for what the index is for.
+    async fn recv_shard(
+        &self,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, SocketAddr, usize)> {
         let mut inbound = self.inbound.lock().await;
-        let payload = inbound.recv().await.ok_or_else(|| {
+        let (idx, payload) = inbound.recv().await.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
                 format!("tcp connection to {} is closed", self.server),
@@ -1348,7 +1410,7 @@ impl TcpClient {
         })?;
         let n = payload.len().min(buf.len());
         buf[..n].copy_from_slice(&payload[..n]);
-        Ok((n, self.server))
+        Ok((n, self.server, idx))
     }
 
     /// Queue `wire` on the subflow chosen for `hint`.
@@ -1442,7 +1504,7 @@ async fn supervise_subflow(
     server: SocketAddr,
     idx: usize,
     outbound: Slots,
-    inbound_tx: mpsc::Sender<Vec<u8>>,
+    inbound_tx: mpsc::Sender<(usize, Vec<u8>)>,
     reader: tokio::task::JoinHandle<std::io::Result<()>>,
     opts: TcpOptions,
 ) {
@@ -1459,7 +1521,7 @@ async fn supervise_subflow(
 
         let (tx, _local, next_reader) = loop {
             attempts += 1;
-            match TcpClient::dial(server, &inbound_tx, opts.clone()).await {
+            match TcpClient::dial(server, idx, &inbound_tx, opts.clone()).await {
                 Ok(v) => break v,
                 Err(e) => {
                     if attempts >= MAX_RECONNECT_ATTEMPTS {
@@ -1530,6 +1592,33 @@ impl Transport {
             Transport::Udp { socket } => socket.recv_from(buf).await,
             Transport::TcpServer(hub) => hub.recv(buf).await,
             Transport::TcpClient(client) => client.recv(buf).await,
+        }
+    }
+
+    /// Receive into `buf`, also reporting which **shard** the packet belongs to.
+    ///
+    /// The shard is a stable function of where the packet came from — the
+    /// subflow index on a TCP client, a hash of the peer address on a TCP
+    /// server, `0` for UDP. It exists so the caller can run several worker
+    /// tasks and dispatch each packet by `shard % workers`: packets that must
+    /// stay ordered (everything from one subflow, or one peer) share a shard
+    /// and therefore one worker, while unrelated sources spread out and their
+    /// crypto runs in parallel.
+    ///
+    /// This matters because a single task doing AEAD per packet is the
+    /// throughput ceiling once the TCP windows are large enough: one core's
+    /// AEAD throughput, not the link, sets the limit.
+    pub async fn recv_sharded(
+        &self,
+        buf: &mut [u8],
+    ) -> std::io::Result<(usize, SocketAddr, usize)> {
+        match self {
+            Transport::Udp { .. } => {
+                let (n, peer) = self.recv(buf).await?;
+                Ok((n, peer, 0))
+            }
+            Transport::TcpServer(hub) => hub.recv_shard(buf).await,
+            Transport::TcpClient(client) => client.recv_shard(buf).await,
         }
     }
 

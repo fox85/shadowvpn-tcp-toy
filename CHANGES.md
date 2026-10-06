@@ -336,6 +336,74 @@ TCP 载波**没有这个约束**——TCP 字节流由内核按自己的 MSS 分
 - 测 UDP 吞吐用 `iperf3 -c <对端> -u -b 200M`，注意 iperf3 自身会报告丢包/乱序统计，
   这正是判断 `UDP_ROTATE_EVERY` 是否合适的最佳指标
 
+## 吞吐：从 ~100 Mbps 到多核并行（目标 500 Mbps）
+
+### 两个瓶颈叠加
+
+实测 TCP-in-TCP 与 UDP-in-TCP 都卡在约 100 Mbps。原因有两个，且是叠加的：
+
+**瓶颈一：发送窗口被锁死（约 100 Mbps 的天花板）**
+
+`apply_tcp_buffers()` 的发送侧犯的正是接收侧文档里警告过的错误：
+`SO_SNDBUF` 会被 clamp 到 `net.core.wmem_max`（默认 208 KiB），**并且**设置它会置
+`SOCK_SNDBUF_LOCK`，禁用内核的发送缓冲自动调优。于是发送窗口锁在约 208 KiB：
+
+```
+208 KiB × 8 / 0.066 s ≈ 25 Mbit/s（单子流）
+× 4 子流 ≈ 100 Mbit/s
+```
+
+与实测吻合——所以加子流完全没用，每条子流的窗口都被锁死。
+
+**修正**：`SO_SNDBUFFORCE` 失败时**不再回退 `SO_SNDBUF`**，什么都不设，让自动调优
+接管（上限 `net.ipv4.tcp_wmem[2]`，默认 4 MiB）。并新增发送侧窗口告警日志。
+
+**瓶颈二：单任务串行做 AEAD（约 100 Mbps 的另一半）**
+
+服务端/客户端两个方向原本都是**单 reader + 单 processor**：所有子流的包汇聚到一个
+mpsc 后，由一个任务串行 de-obfs → 解密 → 路由 → 写 TUN（或反向加密 → 发送）。AEAD
+是每包 CPU 密集操作，单核吞吐远低于千兆；再加上 TUN 每包一次 syscall。
+
+**修正**：拆成 **reader + N 个 worker**（`worker_count()`，取
+`available_parallelism()` clamp 到 2..=8，默认 4）。分发键按方向选择：
+
+| 方向 | 分发键 | 理由 |
+| --- | --- | --- |
+| 服务端 carrier→TUN | peer 哈希（`recv_sharded` 的 shard）| 多子流/多客户端天然分散 |
+| 服务端 TUN→carrier | 内层 5 元组哈希（`classify`）| TUN 读出的是明文，可按内层流分散 |
+| 客户端 TUN→net | 内层 5 元组哈希 | 同上 |
+| 客户端 net→TUN | 子流索引 | 包都来自同一 server 地址，按子流分 |
+
+**同一条内层连接恒定落同一 worker**，顺序得以保持；不同连接并行跑在不同核上。
+控制消息（keepalive/assign/route push）解密后由各 worker 处理，共享状态
+（routing / NAT / installer）全部通过 `Mutex` / `RwLock` 访问。
+
+任务生命周期用 `JoinSet`：`join_next()` 等第一个结束（reader 或任一 worker），
+然后 `abort_all()` 收尾——任一端失败即整体退出，语义与原 `select!` 一致。
+
+### 新增 API
+
+* `shadowvpn::worker_count()` — worker 数量
+* `Transport::recv_sharded()` — 额外返回分片索引 `(n, peer, shard)`
+* `TcpHub::recv_shard` / `TcpClient::recv_shard` — 分别按 peer 哈希、子流索引分片
+* 客户端 `TcpClient` 的 inbound 通道携带子流索引 `(usize, Vec<u8>)`
+
+### 上线前请确认
+
+以 root 运行（否则 `SO_SNDBUFFORCE` / `SO_RCVBUFFORCE` 拿不到 `CAP_NET_ADMIN`，
+退回自动调优，窗口上限约 4 MiB 而非 16 MiB）：
+
+```sh
+sysctl -w net.core.rmem_max=16777216
+sysctl -w net.core.wmem_max=16777216
+sysctl -w net.ipv4.tcp_rmem='4096 1048576 16777216'
+sysctl -w net.ipv4.tcp_wmem='4096 1048576 16777216'
+sysctl -w net.ipv4.tcp_congestion_control=bbr
+sysctl -w net.core.default_qdisc=fq
+```
+
+`iperf3 -P 8` 测聚合（单流只能吃到一条子流）。启动日志若有窗口告警，按提示调 sysctl。
+
 ## TCP 随机长度填充（Padding）
 
 ### 需求
