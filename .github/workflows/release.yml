@@ -42,11 +42,11 @@ jobs:
           #   *runtime* on x86, so a portable build still uses it when present.
           #   (Use `-C target-cpu=native` for local builds on the target box.)
           - target: x86_64-unknown-linux-musl
-            rustflags: ""
+            rustflags: "-C target-feature=+aes,+pclmulqdq"
           - target: aarch64-unknown-linux-musl
             rustflags: "-C target-feature=+aes,+neon"
           - target: armv7-unknown-linux-musleabihf
-            rustflags: ""
+            rustflags: "-C target-feature=+neon"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
