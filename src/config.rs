@@ -259,6 +259,16 @@ pub struct FileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workers: Option<usize>,
 
+
+    /// Seconds between TCP reconnect attempts (client only). `0` uses the
+    /// default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconnect_interval: Option<u64>,
+
+    /// Consecutive failed TCP reconnect attempts before the client gives up
+    /// (client only). `0` retries forever, which is the default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reconnect_max: Option<u32>,
     /// Carrier protocol: `"udp"` (default) or `"tcp"`. Must match the other end.
     ///
     /// With `"tcp"` the same frames are carried on a TCP stream, each prefixed
@@ -523,6 +533,10 @@ pub struct ClientConfig {
     pub padding: usize,
     /// Packet-processing workers per direction (AEAD + DNS intercept).
     pub workers: usize,
+    /// Seconds between TCP reconnect attempts; `0` uses the default.
+    pub reconnect_interval: u64,
+    /// Consecutive failed reconnects before giving up; `0` retries forever.
+    pub reconnect_max: u32,
     /// Negotiated AEAD cipher (`Cipher::None` disables encryption).
     pub cipher: Cipher,
     /// `EVP_BytesToKey`-derived master key (length == `cipher.key_len()`).
@@ -703,6 +717,15 @@ pub struct ClientArgs {
     #[arg(long = "workers", value_name = "N")]
     pub workers: Option<usize>,
 
+
+    /// Seconds to wait between TCP reconnect attempts (default 5).
+    #[arg(long = "reconnect-interval", value_name = "SECS")]
+    pub reconnect_interval: Option<u64>,
+
+    /// Give up after this many consecutive failed TCP reconnects (default 0,
+    /// which retries forever).
+    #[arg(long = "reconnect-max", value_name = "N")]
+    pub reconnect_max: Option<u32>,
     /// Explicit TUN interface name.
     #[arg(long = "tun-name")]
     pub tun_name: Option<String>,
@@ -1400,6 +1423,11 @@ impl ClientArgs {
         let subflows = resolve_subflows(self.subflows.or(file.subflows), transport)?;
         let padding = resolve_padding(self.padding.or(file.padding), transport)?;
         let workers = crate::worker_count(self.workers.or(file.workers));
+        // `0` means "unset" for the interval (use the default), but means
+        // "retry forever" for the attempt cap — so both stay as written and
+        // are interpreted at the point of use.
+        let reconnect_interval = self.reconnect_interval.or(file.reconnect_interval);
+        let reconnect_max = self.reconnect_max.or(file.reconnect_max);
 
         let (cipher, master_key) =
             resolve_crypto(self.cipher.or(file.cipher), self.password.or(file.password))?;
@@ -1451,6 +1479,8 @@ impl ClientArgs {
             subflows,
             padding,
             workers,
+            reconnect_interval: reconnect_interval.unwrap_or(0),
+            reconnect_max: reconnect_max.unwrap_or(0),
             cipher,
             master_key,
             tun,
@@ -1564,6 +1594,8 @@ mod tests {
                 transport: None,
                 padding: None,
                 workers: None,
+                reconnect_interval: None,
+                reconnect_max: None,
                 tun_name: None,
                 tun_ip: None,
                 tun_netmask: None,
@@ -1606,6 +1638,8 @@ mod tests {
                 subflows: None,
                 padding: None,
                 workers: None,
+                reconnect_interval: None,
+                reconnect_max: None,
                 tun_name: None,
                 tun_ip: None,
                 tun_netmask: None,
@@ -1646,6 +1680,8 @@ mod tests {
             transport: None,
             padding: None,
             workers: None,
+            reconnect_interval: None,
+            reconnect_max: None,
             tun_name: Some("utun9".to_string()),
             tun_ip: Some(Ipv4Addr::new(10, 9, 0, 1)),
             tun_netmask: None,
@@ -2091,6 +2127,8 @@ mod tests {
             transport: None,
             padding: None,
             workers: None,
+            reconnect_interval: None,
+            reconnect_max: None,
             tun_name: None,
             tun_ip: Some(Ipv4Addr::new(10, 9, 0, 1)),
             tun_netmask: None,
@@ -2179,6 +2217,8 @@ mod tests {
             transport: None,
             padding: None,
             workers: None,
+            reconnect_interval: None,
+            reconnect_max: None,
             tun_name: None,
             tun_ip: Some(Ipv4Addr::new(10, 77, 0, 1)),
             tun_netmask: None,

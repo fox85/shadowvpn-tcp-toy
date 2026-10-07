@@ -404,6 +404,75 @@ sysctl -w net.core.default_qdisc=fq
 
 `iperf3 -P 8` 测聚合（单流只能吃到一条子流）。启动日志若有窗口告警，按提示调 sysctl。
 
+## 客户端重连策略可配置（原来连败 10 次就退出）
+
+### 原来是什么行为
+
+`transport.rs` 里两个硬编码常量：
+
+```rust
+const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+```
+
+每条子流连续拨号失败 10 次后 supervisor 返回；所有子流的 supervisor 都返回后，
+入站通道的 sender 全部 drop，`recv()` 返回 `NotConnected`，relay 循环报错退出 ——
+**进程就结束了**。在无人值守设备上，服务端重启一次客户端就没了。
+
+### 新增两个配置项（仅客户端，TCP 模式）
+
+| 配置 | CLI | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- | --- |
+| `reconnect_interval` | `--reconnect-interval` | 秒 | 5 | 每次重连之间的等待，**单位是秒** |
+| `reconnect_max` | `--reconnect-max` | 次 | `0` | 连续失败多少次后放弃；**`0` = 无限次** |
+
+```json
+{
+  "server": "vpn.example.com:8388",
+  "transport": "tcp",
+  "reconnect_interval": 10,
+  "reconnect_max": 0
+}
+```
+
+```bash
+shadowvpn-client -c client.json -t tcp --reconnect-interval 10 --reconnect-max 0
+```
+
+CLI 优先于 JSON，与其余字段一致。
+
+### 两个 `0` 的含义不同，别混淆
+
+| 字段 | `0` 的意思 |
+| --- | --- |
+| `reconnect_interval: 0` | **未设置** → 用默认 5 秒 |
+| `reconnect_max: 0` | **无限次重试** → 永不放弃 |
+
+这是有意的非对称：间隔不可能真的是 0 秒（会打成 SYN 风暴），而"放弃次数"为 0
+天然读作"永不放弃"。解析逻辑在 `reconnect_policy()` 里集中处理，避免散落各处。
+
+### 默认值变了（重要）
+
+原行为是"连败 10 次退出"。现在默认 `reconnect_max = 0`，即**永不放弃**——
+这正是本次诉求（你不希望它自己退出）。若想恢复"失败若干次后退出"，显式给一个正数。
+
+间隔默认也从 500 ms 提到 **5 秒**：重连是低频事件，慢一点不会损失什么，
+但能避免对一台正在重启的服务端持续猛打。
+
+### 初次连接也走同一策略
+
+原来 `TcpClient::connect` 里初次拨号失败直接 `?` 返回，进程立即退出——
+那么服务端在客户端启动时恰好不可用，`reconnect_max` 就形同虚设。
+
+现在抽出 `dial_retrying()`，初次连接与后续重连共用：
+**启动时服务端不可用只是"第一次尝试失败"**，按同样策略重试。
+只有达到上限才返回 `NotConnected` 让进程退出。
+
+### 测试
+
+* 未设置 → 默认间隔 + 无限次
+* 显式值 → 秒数换算与上限均生效
+
 ## 批量 I/O：摊薄每次 hand-off 的固定成本
 
 ### 先说清楚：批量能省什么、不能省什么

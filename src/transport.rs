@@ -210,12 +210,88 @@ const WRITE_BATCH_FRAMES: usize = 64;
 /// How long the accept loop backs off after a transient `accept()` failure.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
-/// How long to wait between client reconnect attempts.
-const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+/// How long to wait between client reconnect attempts when the config does not
+/// say otherwise.
+///
+/// Reconnects are rare (a dropped tunnel, a server restart), so a slow cadence
+/// is fine and avoids hammering a server that is down.
+pub const DEFAULT_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// How many consecutive reconnect attempts a subflow makes before giving up
-/// (and letting the process exit so a supervisor can restart it).
-const MAX_RECONNECT_ATTEMPTS: u32 = 10;
+/// when the config does not say otherwise. `0` retries forever.
+pub const DEFAULT_RECONNECT_MAX: u32 = 0;
+
+/// Resolve the reconnect policy from config: `(delay between attempts, attempt
+/// cap)`.
+///
+/// The two `0`s mean different things and must not be conflated: an unset
+/// interval falls back to the default, while a `0` cap means *retry forever*
+/// (which is also the default, since a client on an unattended device should
+/// wait for its server rather than exit).
+fn reconnect_policy(opts: &TcpOptions) -> (Duration, u32) {
+    let delay = if opts.reconnect_interval == 0 {
+        DEFAULT_RECONNECT_INTERVAL
+    } else {
+        Duration::from_secs(opts.reconnect_interval)
+    };
+    let cap = if opts.reconnect_max == 0 {
+        DEFAULT_RECONNECT_MAX
+    } else {
+        opts.reconnect_max
+    };
+    (delay, cap)
+}
+
+/// One successful dial: outbound sender, local address, reader task.
+type Dialled = (
+    mpsc::Sender<Vec<u8>>,
+    Option<SocketAddr>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+);
+
+/// Dial one subflow, retrying per the configured policy.
+///
+/// Shared by the initial connect and by [`supervise_subflow`] so **a server
+/// that is down when the client starts is not fatal** — it is simply the first
+/// of the attempts. `attempts` is caller-owned so it survives across
+/// reconnects of the same subflow and resets on success.
+///
+/// Returns `None` once the cap is reached; `0` means it never returns `None`.
+async fn dial_retrying(
+    server: SocketAddr,
+    idx: usize,
+    inbound_tx: &mpsc::Sender<(usize, Vec<u8>)>,
+    opts: &TcpOptions,
+    attempts: &mut u32,
+) -> Option<Dialled> {
+    let (delay, cap) = reconnect_policy(opts);
+    loop {
+        *attempts += 1;
+        match TcpClient::dial(server, idx, inbound_tx, opts.clone()).await {
+            Ok(v) => return Some(v),
+            Err(e) => {
+                if cap != 0 && *attempts >= cap {
+                    warn!(
+                        "tcp: subflow {idx} giving up on {server} after {attempts} attempt(s): {e}"
+                    );
+                    return None;
+                }
+                if cap == 0 {
+                    warn!(
+                        "tcp: subflow {idx} connect to {server} failed (attempt {attempts}, retrying in {}s): {e}",
+                        delay.as_secs()
+                    );
+                } else {
+                    warn!(
+                        "tcp: subflow {idx} connect to {server} failed ({attempts}/{cap}, retrying in {}s): {e}",
+                        delay.as_secs()
+                    );
+                }
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
 
 /// Choose which subflow carries one frame, given each subflow's current queue.
 ///
@@ -341,6 +417,12 @@ pub struct TcpOptions {
     /// Upper bound on random padding per frame; 0 disables it. See
     /// [`DEFAULT_PADDING_MAX`].
     pub padding: usize,
+    /// Seconds to wait between reconnect attempts. `0` means
+    /// [`DEFAULT_RECONNECT_INTERVAL`].
+    pub reconnect_interval: u64,
+    /// Consecutive failed attempts before a subflow gives up; `0` means retry
+    /// forever (see [`DEFAULT_RECONNECT_MAX`]).
+    pub reconnect_max: u32,
 }
 
 /// How a packet should be placed on the subflows.
@@ -1310,7 +1392,21 @@ impl TcpClient {
         let mut local = None;
 
         for idx in 0..subflows {
-            let (tx, addr, reader) = Self::dial(server, idx, &inbound_tx, opts.clone()).await?;
+            // Same policy as a later reconnect: a server that is down while the
+            // client is starting is just a failed first attempt, not a reason
+            // to exit — otherwise `reconnect_max` would be meaningless for the
+            // very outage it exists to cover.
+            let mut attempts = 0u32;
+            let (tx, addr, reader) =
+                match dial_retrying(server, idx, &inbound_tx, &opts, &mut attempts).await {
+                    Some(v) => v,
+                    None => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::NotConnected,
+                            format!("gave up connecting subflow {idx} to {server}"),
+                        ))
+                    }
+                };
             if idx == 0 {
                 local = addr;
             }
@@ -1522,22 +1618,11 @@ async fn supervise_subflow(
         }
         outbound.write().await[idx] = None;
 
-        let (tx, _local, next_reader) = loop {
-            attempts += 1;
-            match TcpClient::dial(server, idx, &inbound_tx, opts.clone()).await {
-                Ok(v) => break v,
-                Err(e) => {
-                    if attempts >= MAX_RECONNECT_ATTEMPTS {
-                        warn!("tcp: subflow {idx} giving up on {server} after {attempts} attempts: {e}");
-                        return;
-                    }
-                    warn!(
-                        "tcp: subflow {idx} reconnect to {server} failed ({attempts}/{MAX_RECONNECT_ATTEMPTS}): {e}"
-                    );
-                    tokio::time::sleep(RECONNECT_DELAY).await;
-                }
-            }
-        };
+        let (tx, _local, next_reader) =
+            match dial_retrying(server, idx, &inbound_tx, &opts, &mut attempts).await {
+                Some(v) => v,
+                None => return, // cap reached; this subflow is done
+            };
 
         attempts = 0;
         outbound.write().await[idx] = Some(tx);
@@ -1765,6 +1850,34 @@ mod tests {
 
     /// Generous bound: these tests are about framing, not plausibility.
     const TEST_PLAUSIBLE: usize = 4096;
+
+    /// `TcpOptions` with just the reconnect policy filled in.
+    fn opts_with_reconnect(interval: u64, max: u32) -> TcpOptions {
+        TcpOptions {
+            buf_len: 4096,
+            validator: None,
+            plausible: TEST_PLAUSIBLE,
+            padding: 0,
+            reconnect_interval: interval,
+            reconnect_max: max,
+        }
+    }
+
+    /// Unset interval falls back to the default; unset cap means unlimited.
+    #[test]
+    fn reconnect_policy_defaults() {
+        let (delay, cap) = reconnect_policy(&opts_with_reconnect(0, 0));
+        assert_eq!(delay, DEFAULT_RECONNECT_INTERVAL);
+        assert_eq!(cap, 0);
+    }
+
+    /// A configured interval is seconds, and a configured cap is honoured.
+    #[test]
+    fn reconnect_policy_configured() {
+        let (delay, cap) = reconnect_policy(&opts_with_reconnect(30, 7));
+        assert_eq!(delay, Duration::from_secs(30));
+        assert_eq!(cap, 7);
+    }
 
     /// Run the async reader on a one-shot runtime so the sync tests can await.
     fn read_all(wire: &[u8], padded: bool) -> Vec<Vec<u8>> {

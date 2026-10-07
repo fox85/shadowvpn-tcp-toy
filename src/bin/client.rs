@@ -189,6 +189,8 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
                 validator: None,
                 plausible: MAX_TCP_FRAME, // we trust the server we dialled
                 padding: cfg.padding,
+                reconnect_interval: cfg.reconnect_interval,
+                reconnect_max: cfg.reconnect_max,
             },
         )
         .await

@@ -378,6 +378,9 @@ async fn run(cfg: ServerConfig) -> Result<()> {
                 validator,
                 plausible: shadowvpn::transport::plausible_frame_limit(cfg.tun.mtu),
                 padding: cfg.padding,
+                // Server-side: no reconnecting to do, so these are unused.
+                reconnect_interval: 0,
+                reconnect_max: 0,
             },
         )
         .await
