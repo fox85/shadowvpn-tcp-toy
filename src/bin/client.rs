@@ -134,6 +134,9 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
     info!("tunnel MTU         : {}", cfg.tun.mtu);
     if cfg.transport.is_tcp() {
         info!("parallel subflows  : {}", cfg.subflows);
+        // Padding only exists on the TCP carrier (UDP frames have no layout to
+        // pad), so report it here rather than unconditionally.
+        shadowvpn::config::report_padding(cfg.padding);
     }
     if cfg.cipher.is_none() {
         // Loud on purpose: `cipher=none` sends IP packets in the clear, and that

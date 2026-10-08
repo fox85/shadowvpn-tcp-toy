@@ -1370,6 +1370,9 @@ fn print_banner(cfg: &ServerConfig, tun_name: &str) {
         info!(
             "  carrier        : TCP, length-prefixed frames; each client may open several parallel connections"
         );
+        // Report the effective value: a mismatch between the ends (or one that
+        // is simply too small) is otherwise invisible without a capture.
+        shadowvpn::config::report_padding(cfg.padding);
         if cfg.nat {
             // NAT mode can't tell "two connections from one client" from "two
             // clients", so a multi-subflow client would get two internal IPs.
