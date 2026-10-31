@@ -137,6 +137,9 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
         // Padding only exists on the TCP carrier (UDP frames have no layout to
         // pad), so report it here rather than unconditionally.
         shadowvpn::config::report_padding(cfg.padding);
+        // With `subflows = 1` this is the number that decides whether a target
+        // rate is reachable at all, so print it rather than make people guess.
+        shadowvpn::net::log_single_stream_ceiling(cfg.tcp_window);
     }
     if cfg.cipher.is_none() {
         // Loud on purpose: `cipher=none` sends IP packets in the clear, and that
@@ -192,6 +195,7 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
                 validator: None,
                 plausible: MAX_TCP_FRAME, // we trust the server we dialled
                 padding: cfg.padding,
+                window: cfg.tcp_window,
                 reconnect_interval: cfg.reconnect_interval,
                 reconnect_max: cfg.reconnect_max,
             },

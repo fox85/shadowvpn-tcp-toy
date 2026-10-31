@@ -302,10 +302,14 @@ async fn dial_retrying(
 /// behind it waits for the retransmit — a head-of-line block lasting an RTT or,
 /// after a timeout, much longer.
 ///
-/// * Inner **TCP** copes with that. It is already ordered and
-///   loss-recovering; the outer stall just looks like a slow link. So inner TCP
-///   is **pinned**: reordering it would produce duplicate ACKs and spurious
-///   fast retransmits, which costs more than parallelism gains.
+/// * Inner **TCP** copes with a stall better than UDP does — it is already
+///   ordered and loss-recovering, so an outer stall just looks like a slow
+///   link. That used to mean it was **pinned** to one subflow, but pinning
+///   caps a single inner connection at one subflow's `window / RTT`, which is
+///   exactly the ceiling extra subflows were supposed to remove. So inner TCP
+///   now rotates too — in *runs*, so that reordering (which would produce
+///   duplicate ACKs and spurious fast retransmits) only happens at run
+///   boundaries. See [`TCP_ROTATE_EVERY`].
 /// * Inner **UDP** does not cope. A UDP flow has no retransmit timer of its
 ///   own, so a pinned UDP flow sees a *total blackout* for the duration of the
 ///   stall. Protocols that estimate RTT (QUIC, WireGuard, VoIP, games) read
@@ -330,19 +334,23 @@ fn pick_subflow(backlogs: &[usize], hash: u32, spin: u32, ordered: bool) -> usiz
     const DEAD: usize = usize::MAX;
 
     if ordered {
-        let pinned = (hash % n as u32) as usize;
-        if backlogs[pinned] != DEAD {
-            return pinned;
+        // Rotate in *runs*: `spin` only advances every TCP_ROTATE_EVERY packets
+        // (see `rotation_epoch`), so the flow holds one subflow for a whole run
+        // and reordering is confined to run boundaries. With TCP_ROTATE_EVERY ==
+        // 0 the epoch is a constant 0 and this degenerates to the old strict
+        // pinning.
+        let target = ((hash ^ spin) % n as u32) as usize;
+        if backlogs[target] != DEAD && backlogs[target] <= ORDERED_SPILL_BACKLOG {
+            return target;
         }
-        // The pinned subflow is down. Sending anywhere else reorders this
-        // flow — but the alternative is dropping every packet until the
-        // reconnect completes, and a reconnect already reorders everything
-        // (the whole connection's packets were lost). So prefer *a* working
-        // subflow over none: pick the least loaded one that is alive.
+        // Dead, or queueing. Prefer *a* working subflow over none: the
+        // alternative is dropping every packet until the reconnect completes,
+        // and a reconnect already reorders everything (the whole connection's
+        // packets were lost).
         return (0..n)
             .filter(|i| backlogs[*i] != DEAD)
             .min_by_key(|i| backlogs[*i])
-            .unwrap_or(pinned);
+            .unwrap_or(target);
     }
     // Among the least-loaded subflows, spread by `hash ^ spin`. `spin` changes
     // every packet, which is what scatters a *single* flow: without it a flow's
@@ -389,6 +397,59 @@ fn pick_subflow(backlogs: &[usize], hash: u32, spin: u32, ordered: bool) -> usiz
 /// genuinely reorder-proof), or raise it if a specific application is sensitive.
 pub const UDP_ROTATE_EVERY: u32 = 16;
 
+/// How many consecutive packets an **ordered** flow (inner TCP) keeps on one
+/// subflow before rotating to the next. `0` restores strict pinning.
+///
+/// ## Why this is no longer `0`
+///
+/// Pinning caps a single inner TCP connection at **one subflow's congestion
+/// window**, i.e. roughly `window / RTT`. With 4 MiB windows and a 180 ms path
+/// that is about 180 Mbit/s — and adding subflows changes nothing, because an
+/// ordered flow only ever uses one of them. That is the ceiling this constant
+/// exists to break: rotating in runs lets one inner connection draw on every
+/// subflow's window at once.
+///
+/// ## Why runs, and not per-packet rotation
+///
+/// Inner TCP treats out-of-order arrival as loss: three duplicate ACKs trigger a
+/// fast retransmit and halve the window. So the flow stays on one subflow for a
+/// whole run and reordering can only occur at a run boundary. At 1500-byte
+/// packets, 64 packets is ~96 KB — about 1.5 ms at 500 Mbit/s — so there are
+/// still hundreds of rotations per RTT and all subflows stay in flight.
+///
+/// Raise it if an application is unusually reorder-sensitive (or set `0` to pin,
+/// accepting the single-subflow ceiling); lower it toward
+/// [`UDP_ROTATE_EVERY`] if the subflows have very similar RTTs and you want a
+/// more even spread.
+pub const TCP_ROTATE_EVERY: u32 = 64;
+
+/// Backlog (queued frames) at which an ordered flow abandons its current
+/// subflow for the least loaded one.
+///
+/// An ordered flow normally stays put for a whole run even if another subflow is
+/// freer, because moving means reordering. But a subflow that is queueing is
+/// about to add latency to every packet in the run, so past this point moving
+/// is the lesser evil.
+pub const ORDERED_SPILL_BACKLOG: usize = 32;
+
+/// Per-packet rotation epoch for subflow selection: `counter / every`, where
+/// `every` depends on whether the flow tolerates reordering.
+///
+/// A `0` divisor would trap, so `every == 0` means "never rotate" rather than
+/// "rotate every packet".
+fn rotation_epoch(counter: u32, ordered: bool) -> u32 {
+    let every = if ordered {
+        TCP_ROTATE_EVERY
+    } else {
+        UDP_ROTATE_EVERY
+    };
+    if every == 0 {
+        0
+    } else {
+        counter / every
+    }
+}
+
 /// Checks whether a received frame is well-formed ShadowVPN traffic.
 ///
 /// Used only for the **first** frame of a connection: that is enough to catch
@@ -417,6 +478,10 @@ pub struct TcpOptions {
     /// Upper bound on random padding per frame; 0 disables it. See
     /// [`DEFAULT_PADDING_MAX`].
     pub padding: usize,
+    /// Socket buffer size per subflow, in bytes. With `subflows = 1` this is
+    /// the single setting that caps throughput, because
+    /// `rate <= window / RTT`; see [`crate::net::DEFAULT_TCP_WINDOW_MB`].
+    pub window: usize,
     /// Seconds to wait between reconnect attempts. `0` means
     /// [`DEFAULT_RECONNECT_INTERVAL`].
     pub reconnect_interval: u64,
@@ -1144,7 +1209,7 @@ impl TcpHub {
     /// `validator` is applied to every connection's first frame; a frame that
     /// fails it resets the connection (see [`Validator`]).
     pub async fn bind(addr: SocketAddr, opts: TcpOptions) -> std::io::Result<Arc<Self>> {
-        let listener: TcpListener = bind_tcp_listener(addr)?;
+        let listener: TcpListener = bind_tcp_listener(addr, opts.window)?;
         let (tx, rx) = mpsc::channel(TCP_CHANNEL_DEPTH);
         let hub = Arc::new(Self {
             inbound: Mutex::new(rx),
@@ -1159,7 +1224,7 @@ impl TcpHub {
             loop {
                 match listener.accept().await {
                     Ok((stream, peer)) => {
-                        if let Err(e) = crate::net::configure_tcp_stream(&stream) {
+                        if let Err(e) = crate::net::configure_tcp_stream(&stream, hub2.opts.window) {
                             debug!("could not tune accepted TCP stream from {peer}: {e}");
                         }
                         // Duplicate the fd *before* splitting: `setsockopt`
@@ -1285,7 +1350,9 @@ impl TcpHub {
     ///
     /// `peers` is every endpoint the destination client is known on — its
     /// parallel subflows — and `hint` says whether reordering is allowed
-    /// (see [`FlowHint`]). Ordered traffic always goes to `preferred`.
+    /// (see [`FlowHint`]). Ordered traffic rotates between them in runs
+    /// ([`TCP_ROTATE_EVERY`]) so a single inner connection can draw on more
+    /// than one subflow's window.
     /// Unordered traffic also goes to `preferred` while it is healthy, and
     /// only spills to the least-backed-up alternative once `preferred` starts
     /// queueing: that keeps a QUIC connection in order in the common case and
@@ -1305,7 +1372,10 @@ impl TcpHub {
             let chosen = match hint {
                 Some(h) if peers.len() > 1 => {
                     // Same epoch division as the client's `send_hint`.
-                    let spin = self.spins.fetch_add(1, Ordering::Relaxed) / UDP_ROTATE_EVERY;
+                    let spin = rotation_epoch(
+                        self.spins.fetch_add(1, Ordering::Relaxed),
+                        h.ordered,
+                    );
                     let backlogs: Vec<usize> =
                         peers.iter().map(|p| backlog(outbound.get(p))).collect();
                     peers[pick_subflow(&backlogs, h.hash, spin, h.ordered)]
@@ -1453,7 +1523,7 @@ impl TcpClient {
         Option<SocketAddr>,
         tokio::task::JoinHandle<std::io::Result<()>>,
     )> {
-        let stream = connect_tcp_stream(server).await?;
+        let stream = connect_tcp_stream(server, opts.window).await?;
         let local = stream.local_addr().ok();
         // Same shared-socket arrangement as the server; see `SharedRead`. The
         // client never arms a RST, so this is purely about keeping one
@@ -1519,7 +1589,7 @@ impl TcpClient {
     /// ciphertext look unrelated, so hashing it would scatter one inner
     /// connection across all subflows and reorder it.
     ///
-    /// Ordered traffic (inner TCP) is pinned. Unordered traffic (inner UDP —
+    /// Ordered traffic (inner TCP) rotates in runs. Unordered traffic (inner UDP —
     /// one QUIC connection is one 5-tuple) starts on its pinned subflow and
     /// spills to the least-backed-up one only when that subflow is queueing.
     /// Without the spill a QUIC connection would be capped at a single
@@ -1538,17 +1608,16 @@ impl TcpClient {
             ));
         }
         let n = self.subflows.max(1);
-        // Divide so `spin` only changes every UDP_ROTATE_EVERY packets: see that
-        // constant for why a per-packet counter is counter-productive.
-        let spin = self.spins.fetch_add(1, Ordering::Relaxed) / UDP_ROTATE_EVERY;
-        let idx = {
-            let outbound = self.outbound.read().await;
-            let backlogs: Vec<usize> = (0..n).map(|i| backlog(slot_of(&outbound, i))).collect();
-            pick_subflow(&backlogs, hint.hash, spin, hint.ordered)
-        };
-
+        // Divide so `spin` only changes every UDP_ROTATE_EVERY / TCP_ROTATE_EVERY
+        // packets: see those constants for why a per-packet counter is
+        // counter-productive, and why ordered flows rotate at all.
+        let spin = rotation_epoch(self.spins.fetch_add(1, Ordering::Relaxed), hint.ordered);
+        // One lock acquisition, not two: picking the subflow and taking its
+        // sender both need the same snapshot, and this is per-packet.
         let tx = {
             let outbound = self.outbound.read().await;
+            let backlogs: Vec<usize> = (0..n).map(|i| backlog(slot_of(&outbound, i))).collect();
+            let idx = pick_subflow(&backlogs, hint.hash, spin, hint.ordered);
             match outbound.get(idx).and_then(|s| s.as_ref()) {
                 Some(tx) => tx.clone(),
                 None => {
@@ -1722,7 +1791,8 @@ impl Transport {
     ///
     /// `hint` carries the classification of the *plaintext* IP packet (see
     /// [`classify`]). Unordered traffic (inner UDP/QUIC) spills off
-    /// `preferred` when it backs up; ordered traffic never does. Computing it
+    /// `preferred` when it backs up; ordered traffic rotates in runs
+    /// ([`TCP_ROTATE_EVERY`]). Computing it
     /// before encryption matters: the AEAD salt makes every ciphertext look
     /// unrelated, so classifying the ciphertext would hash away the very
     /// 5-tuple this depends on.
@@ -1851,6 +1921,52 @@ mod tests {
     /// Generous bound: these tests are about framing, not plausibility.
     const TEST_PLAUSIBLE: usize = 4096;
 
+    /// A `0` divisor must mean "never rotate", not "rotate every packet" —
+    /// the latter would divide by zero.
+    #[test]
+    fn rotation_epoch_zero_never_rotates() {
+        assert_eq!(rotation_epoch(0, true), 0);
+        assert_eq!(rotation_epoch(12345, true), 0);
+    }
+
+    /// Ordered flows rotate far more slowly than unordered ones, which is what
+    /// keeps a run intact and reordering confined to run boundaries.
+    #[test]
+    fn rotation_epoch_ordered_is_slower() {
+        // 0..UDP_ROTATE_EVERY-1 is epoch 0 for unordered, but still 0 for
+        // ordered well past UDP_ROTATE_EVERY.
+        assert_eq!(rotation_epoch(UDP_ROTATE_EVERY, false), 1);
+        assert_eq!(rotation_epoch(UDP_ROTATE_EVERY, true), 0);
+        assert_eq!(rotation_epoch(TCP_ROTATE_EVERY, true), 1);
+    }
+
+    /// An ordered flow changes subflow only when its epoch changes: several
+    /// packets in a row land on the same one.
+    #[test]
+    fn ordered_flow_holds_a_run() {
+        let backlogs = [0usize, 0, 0, 0];
+        let first = pick_subflow(&backlogs, 0x1234, rotation_epoch(0, true), true);
+        for c in 1..TCP_ROTATE_EVERY {
+            assert_eq!(
+                pick_subflow(&backlogs, 0x1234, rotation_epoch(c, true), true),
+                first,
+                "run broke at packet {c}"
+            );
+        }
+        // The next epoch is allowed to move (it need not, but it must not be
+        // pinned for ever).
+        let _ = pick_subflow(&backlogs, 0x1234, rotation_epoch(TCP_ROTATE_EVERY, true), true);
+    }
+
+    /// An ordered flow abandons a backed-up subflow rather than queueing.
+    #[test]
+    fn ordered_flow_spills_when_backed_up() {
+        let backlogs = [0usize, 0, ORDERED_SPILL_BACKLOG + 1, 0];
+        let epoch = rotation_epoch(0, true);
+        let idx = pick_subflow(&backlogs, 0, epoch, true);
+        assert_ne!(idx, 2, "stayed on the congested subflow");
+    }
+
     /// `TcpOptions` with just the reconnect policy filled in.
     fn opts_with_reconnect(interval: u64, max: u32) -> TcpOptions {
         TcpOptions {
@@ -1858,6 +1974,7 @@ mod tests {
             validator: None,
             plausible: TEST_PLAUSIBLE,
             padding: 0,
+            window: 4 * 1024 * 1024,
             reconnect_interval: interval,
             reconnect_max: max,
         }

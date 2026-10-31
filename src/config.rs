@@ -41,6 +41,7 @@ use crate::mesh::{
 use crate::policy::{Mode, PolicyConfig};
 use crate::pool::host_range;
 use crate::protocol::{DEFAULT_TUN_MTU, DEFAULT_TUN_MTU_TCP};
+use crate::net::{DEFAULT_TCP_WINDOW_MB, MAX_TCP_WINDOW_MB};
 use crate::transport::{DEFAULT_PADDING_MAX, MAX_PADDING};
 use crate::state::default_client_state_path;
 
@@ -260,6 +261,10 @@ pub struct FileConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workers: Option<usize>,
 
+    /// TCP socket buffer per subflow, in MiB. Governs the single-subflow
+    /// ceiling: `rate <= window / RTT`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_window_mb: Option<usize>,
 
     /// Seconds between TCP reconnect attempts (client only). `0` uses the
     /// default.
@@ -488,6 +493,8 @@ pub struct ServerConfig {
     /// Upper bound on random per-frame padding on the TCP carrier (0 disables).
     /// Must match the client: enabling it changes the frame layout.
     pub padding: usize,
+    /// TCP socket buffer per subflow, in bytes (`tcp_window_mb` resolved).
+    pub tcp_window: usize,
     /// Packet-processing workers per direction (AEAD + routing).
     pub workers: usize,
     /// Negotiated AEAD cipher (`Cipher::None` disables encryption).
@@ -534,6 +541,8 @@ pub struct ClientConfig {
     pub padding: usize,
     /// Packet-processing workers per direction (AEAD + DNS intercept).
     pub workers: usize,
+    /// TCP socket buffer per subflow, in bytes (`tcp_window_mb` resolved).
+    pub tcp_window: usize,
     /// Seconds between TCP reconnect attempts; `0` uses the default.
     pub reconnect_interval: u64,
     /// Consecutive failed reconnects before giving up; `0` retries forever.
@@ -608,6 +617,12 @@ pub struct ServerArgs {
     /// mostly contend.
     #[arg(long = "workers", value_name = "N")]
     pub workers: Option<usize>,
+
+    /// TCP socket buffer per subflow, in MiB (default 4). Governs the
+    /// single-subflow ceiling: `rate <= window / RTT`. Raise it for
+    /// long-RTT paths (also raise net.core.rmem_max / wmem_max).
+    #[arg(long = "tcp-window-mb", value_name = "MB")]
+    pub tcp_window_mb: Option<usize>,
 
     /// Explicit TUN interface name.
     #[arg(long = "tun-name")]
@@ -717,6 +732,12 @@ pub struct ClientArgs {
     /// mostly contend.
     #[arg(long = "workers", value_name = "N")]
     pub workers: Option<usize>,
+
+    /// TCP socket buffer per subflow, in MiB (default 4). Governs the
+    /// single-subflow ceiling: `rate <= window / RTT`. Raise it for
+    /// long-RTT paths (also raise net.core.rmem_max / wmem_max).
+    #[arg(long = "tcp-window-mb", value_name = "MB")]
+    pub tcp_window_mb: Option<usize>,
 
 
     /// Seconds to wait between TCP reconnect attempts (default 5).
@@ -894,6 +915,22 @@ pub fn report_padding(padding: usize) {
     } else {
         info!("  frame padding  : 0..={padding} random bytes per frame");
     }
+}
+
+/// Resolve the per-subflow TCP socket buffer from a MiB config value.
+///
+/// Validated rather than clamped: a value Linux would silently halve (or that
+/// would exhaust memory across many subflows) should be rejected at startup,
+/// not discovered later as an unexplained throughput ceiling.
+fn resolve_tcp_window(mb: Option<usize>) -> Result<usize, ConfigError> {
+    let mb = mb.unwrap_or(DEFAULT_TCP_WINDOW_MB);
+    if mb == 0 || mb > MAX_TCP_WINDOW_MB {
+        return Err(ConfigError::Invalid {
+            field: "tcp_window_mb",
+            message: format!("must be between 1 and {MAX_TCP_WINDOW_MB}, got {mb}"),
+        });
+    }
+    Ok(mb * 1024 * 1024)
 }
 
 fn resolve_padding(padding: Option<usize>, transport: TransportKind) -> Result<usize, ConfigError> {
@@ -1340,6 +1377,7 @@ impl ServerArgs {
 
         let transport = resolve_transport(self.transport.or(file.transport))?;
         let padding = resolve_padding(self.padding.or(file.padding), transport)?;
+        let tcp_window = resolve_tcp_window(self.tcp_window_mb.or(file.tcp_window_mb))?;
         let workers = crate::worker_count(self.workers.or(file.workers));
 
         let (cipher, master_key) =
@@ -1419,6 +1457,7 @@ impl ServerArgs {
             listen,
             transport,
             padding,
+            tcp_window,
             workers,
             cipher,
             master_key,
@@ -1454,6 +1493,7 @@ impl ClientArgs {
         let transport = resolve_transport(self.transport.or(file.transport))?;
         let subflows = resolve_subflows(self.subflows.or(file.subflows), transport)?;
         let padding = resolve_padding(self.padding.or(file.padding), transport)?;
+        let tcp_window = resolve_tcp_window(self.tcp_window_mb.or(file.tcp_window_mb))?;
         let workers = crate::worker_count(self.workers.or(file.workers));
         // `0` means "unset" for the interval (use the default), but means
         // "retry forever" for the attempt cap — so both stay as written and
@@ -1510,6 +1550,7 @@ impl ClientArgs {
             transport,
             subflows,
             padding,
+            tcp_window,
             workers,
             reconnect_interval: reconnect_interval.unwrap_or(0),
             reconnect_max: reconnect_max.unwrap_or(0),
@@ -1626,6 +1667,7 @@ mod tests {
                 transport: None,
                 padding: None,
                 workers: None,
+                tcp_window_mb: None,
                 reconnect_interval: None,
                 reconnect_max: None,
                 tun_name: None,
@@ -1670,6 +1712,7 @@ mod tests {
                 subflows: None,
                 padding: None,
                 workers: None,
+                tcp_window_mb: None,
                 reconnect_interval: None,
                 reconnect_max: None,
                 tun_name: None,
@@ -1712,6 +1755,7 @@ mod tests {
             transport: None,
             padding: None,
             workers: None,
+            tcp_window_mb: None,
             reconnect_interval: None,
             reconnect_max: None,
             tun_name: Some("utun9".to_string()),
@@ -1841,6 +1885,28 @@ mod tests {
     }
 
     #[test]
+    /// The TCP window is what caps a *single* subflow, since
+    /// `rate <= window / RTT`. Defaults and bounds must be sane.
+    #[test]
+    fn tcp_window_default_and_bounds() {
+        assert_eq!(resolve_tcp_window(None).unwrap(), DEFAULT_TCP_WINDOW_MB * 1024 * 1024);
+        assert_eq!(resolve_tcp_window(Some(8)).unwrap(), 8 * 1024 * 1024);
+        // 0 and oversized values are rejected, not clamped: a silently halved
+        // window is an unexplained throughput ceiling.
+        for bad in [0usize, MAX_TCP_WINDOW_MB + 1, 4096] {
+            assert!(
+                matches!(
+                    resolve_tcp_window(Some(bad)),
+                    Err(ConfigError::Invalid {
+                        field: "tcp_window_mb",
+                        ..
+                    })
+                ),
+                "should reject {bad}"
+            );
+        }
+    }
+
     /// The bound below which padding stops being worth anything. A capture
     /// showed `padding: 8` producing 85 distinct frame lengths where
     /// `padding: 64` produced 170 over comparable traffic — hence the warning
@@ -2190,6 +2256,7 @@ mod tests {
             transport: None,
             padding: None,
             workers: None,
+            tcp_window_mb: None,
             reconnect_interval: None,
             reconnect_max: None,
             tun_name: None,
@@ -2280,6 +2347,7 @@ mod tests {
             transport: None,
             padding: None,
             workers: None,
+            tcp_window_mb: None,
             reconnect_interval: None,
             reconnect_max: None,
             tun_name: None,

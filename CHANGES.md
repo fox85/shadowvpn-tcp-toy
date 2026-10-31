@@ -559,6 +559,229 @@ sudo tcpdump -i any -nn 'host <ip> and port 6543 and tcp[tcpflags] & tcp-push !=
 
 这样下次不用抓包，启动日志里就能直接核对两端是否一致。
 
+## 单流（subflows=1）能否突破 500 Mbps？
+
+### 直接答案：能，但有硬条件，且这个条件不由代码决定
+
+单流下只有 **一个拥塞窗口**，因此存在一个无法绕过的不等式：
+
+```
+吞吐 ≤ window / RTT
+```
+
+这是协议级的上限 —— 加 worker、加批量、零拷贝、换 cipher 都**无法**突破，
+它们减少的是每包开销，不是窗口。反解出 500 Mbps 所需的窗口：
+
+| RTT | 500 Mbps 所需窗口 | 1 Gbps 所需窗口 | 默认 4 MiB 够吗 |
+| --- | --- | --- | --- |
+| 10 ms | 625 KiB | 1.2 MiB | 够（余量很大） |
+| 30 ms | 1.9 MiB | 3.8 MiB | 够 |
+| 66 ms | 4.1 MiB | 8.3 MiB | 临界 |
+| 100 ms | 6.3 MiB | 12.5 MiB | **不够** |
+| 180 ms | 11.3 MiB | 22.5 MiB | **不够** |
+
+**所以：RTT ≤ 66 ms 时默认配置即可达标；RTT 更长必须调大窗口。**
+
+### 第二个硬条件：丢包
+
+单流没有任何冗余 —— 一个丢段就 stall 整条流。用 Mathis 公式估算 CUBIC：
+
+```
+rate ≈ MSS / (RTT × √p)
+```
+
+30 ms RTT 下要到 500 Mbps，需要 p ≈ 6×10⁻⁷（每 160 万个包才丢一个）。
+**CUBIC 在单流高吞吐下几乎必然达不到**，所以 **BBR 是必需的，不是可选的**
+（代码里已默认请求 BBR，但需内核支持且 qdisc 为 `fq`）。
+
+### 第三个条件：单流还会把解密压到单核
+
+入站按 shard 分片，而 shard 就是子流索引 —— `subflows=1` 意味着**所有入站包
+都落到一个 worker**，加解密只用一核。好在 AEAD 在 x64 上每核可达数 GB/s，
+500 Mbps 只占百分之几，不是瓶颈；但这是单流相比多流的一项真实退化。
+
+### 为达标所做的改动
+
+**1. 窗口可配置**（核心改动）
+
+新增 `tcp_window_mb`（CLI `--tcp-window-mb`，JSON 同名字段），默认 4，
+范围 1..=32，**越界直接报错而非静默截断**（被悄悄砍半的窗口会变成一个
+说不清的吞吐天花板）。
+
+```json
+{ "transport": "tcp", "subflows": 1, "tcp_window_mb": 16 }
+```
+
+```bash
+shadowvpn-client -c client.json -t tcp --subflows 1 --tcp-window-mb 16
+```
+
+配套 sysctl（窗口上限必须跟着放开，否则 `SO_*BUFFORCE` 也拿不到）：
+
+```sh
+sysctl -w net.core.rmem_max=33554432
+sysctl -w net.core.wmem_max=33554432
+sysctl -w net.ipv4.tcp_rmem='4096 1048576 33554432'
+sysctl -w net.ipv4.tcp_wmem='4096 1048576 33554432'
+```
+
+**2. `TCP_NOTSENT_LOWAT` 随窗口缩放**
+
+原来固定 512 KiB。现在取 `clamp(window/8, 64 KiB, 512 KiB)`：
+窗口 1 MiB 时 512 KiB 会占半个管道，窗口 32 MiB 时又会白白闲置写端。
+
+**3. 启动时打印单流天花板**
+
+新增 `net::log_single_stream_ceiling()`，两端启动横幅输出：
+
+```
+tcp window     : 16 MiB per subflow; single-subflow ceiling
+                 ~13421 Mbit/s at 10 ms RTT, ~4473 at 30 ms,
+                 ~2033 at 66 ms, ~1342 at 100 ms
+```
+
+不用猜、不用抓包，直接看到当前窗口在各 RTT 下的上限。
+
+**4. 新增测试**
+
+`resolve_tcp_window` 的默认值、合法值、以及 0 / 超限 / 4096 均被拒绝。
+
+### 建议的验证步骤
+
+```bash
+# 1. 先看启动横幅里的天花板行，确认窗口够
+# 2. 用 ss 确认 BBR 与 RTT、cwnd 实际值
+ss -ti '( sport = :8388 )'
+# 3. 打流（单流也要 -P 1 才测的是单流上限；-P 8 测聚合）
+iperf3 -c <对端隧道IP> -P 1
+```
+
+**如果 RTT 很大（>100 ms）又必须用单流**：把 `tcp_window_mb` 提到 16~32，
+并按上面调 sysctl。仍不达标的话，说明瓶颈是丢包或 RTT 本身 —— 那时候唯一
+有效的办法是增加 subflows（多窗口并行），单流在物理上做不到。
+
+## 突破 TCP 模式单流 180 Mbps 天花板：有序流量改为「按段轮转」
+
+### 为什么卡在 180 Mbps
+
+之前的设计是：**内层 TCP 被钉死（pin）在一条子流上**。理由是 TCP 对乱序敏感——
+三个重复 ACK 就触发快速重传并把窗口砍半，所以宁可不打散。
+
+但这个理由掩盖了一个致命后果：
+
+```
+单条内层 TCP 连接的上限 = 一条子流的 window / RTT
+```
+
+**加多少条子流都没用——有序流量永远只用其中一条。** 4 MiB 窗口、180 ms 的路径：
+
+```
+4 MiB × 8 / 0.18 s ≈ 186 Mbit/s
+```
+
+与实测的 180 Mbps 几乎完全吻合。这也解释了此前的一个矛盾现象：
+**UDP-in-TCP 加了子流有明显提升，TCP-in-TCP 没有** —— 因为 UDP 打散了，TCP 被钉住。
+
+### 修正：内层 TCP 也轮转，但按「段」
+
+新增 `TCP_ROTATE_EVERY = 64`（`src/transport.rs`）：
+
+* 连续 64 个包留在同一条子流上（段内严格有序，重传计数器安静）
+* 段与段之间才换条 —— 乱序被限制在段边界
+* 1500 字节包下一段约 96 KB，500 Mbps 时约 1.5 ms，一个 RTT 内有几百次轮转，
+  所有子流始终同时在飞
+
+也就是说：轮转让一条内层连接能同时吃 **N 条子流的窗口**，而分段把代价（乱序）
+压到最小。这是「要突破单流 window/RTT，就必须多用几条子流」的唯一解 —— 没有
+两全其美的办法，只能在「单流窗口上限」和「少量乱序」之间选，现在这个权衡可以调。
+
+`TCP_ROTATE_EVERY = 0` 即恢复原来的严格钉住（接受单子流上限）。
+
+### 配套改动
+
+* `rotation_epoch(counter, ordered)` —— 统一的轮转周期计算，**`0` 表示「永不轮转」
+  而不是「每包轮转」**（后者会除零）。无序流量仍用 `UDP_ROTATE_EVERY = 16`
+* `ORDERED_SPILL_BACKLOG = 32` —— 有序流量在子流积压超过 32 帧时，放弃当前段目标
+  改投最空闲的一条。因为此时继续留在上面等于给整段都加延迟，移动反而是较小代价
+* 客户端 `send_hint` 原来**每包取两次 `outbound` 读锁**（一次选子流、一次取 sender），
+  合并为一次 —— 这是每包开销，4 个 worker 并发时锁竞争明显
+* 服务端 `queue` 与客户端 `send_hint` 都改用 `rotation_epoch`，两端轮转节奏一致
+
+### 新增 4 个测试
+
+* `0` 周期不轮转（且不会除零）
+* 有序比无序轮转慢得多
+* **有序流在段内不换子流**（逐包验证 64 个包都落在同一条）
+* 有序流在子流积压时会溢出
+
+### 预期与调参
+
+| 场景 | 修正前 | 修正后 |
+| --- | --- | --- |
+| 单条内层 TCP 流 | ~180 Mbps（单子流窗口） | 最多 N 条子流窗口之和 |
+| 多条内层 TCP 流 | 已可分散 | 不变 |
+| 内层 UDP | 已可分散 | 不变 |
+
+4 子流下理论可达 `4 × 180 = 720 Mbps`，扣掉乱序与调度损耗，500 Mbps 是现实的。
+
+**如果加了轮转后出现变慢**（说明路径上各子流 RTT 差异大于段时长，乱序严重）：
+调大 `TCP_ROTATE_EVERY`（128 / 256），或设 `0` 回到钉住。
+
+**先确认窗口是否真的生效**：启动日志若有窗口告警，说明 `SO_*BUFFORCE` 没拿到
+`CAP_NET_ADMIN`，需以 root 运行或调 sysctl（见上文 TCP 接收窗口一节）。
+
+## 新增 x64 Windows 编译配置（x86_64-pc-windows-msvc）
+
+在 `.github/workflows/release.yml` 原有三个 Linux target 之外，新增一个独立的
+`build-windows` job。
+
+### 为什么是独立 job，而不是 matrix 里再加一行
+
+三个地方全都不同，塞进同一个 matrix 只会让每一步都变成条件判断：
+
+| | Linux job | Windows job |
+| --- | --- | --- |
+| runner | `ubuntu-22.04` | `windows-latest`（原生） |
+| 工具链 | `cross`（Docker 提供 sysroot） | 直接 `cargo build` |
+| shell | bash | pwsh |
+| 归档 | `.tar.gz` | `.zip` |
+| 产物 | `shadowvpn-server` | `shadowvpn-server.exe` |
+
+**关键限制**：`cross` 无法构建 `-msvc` target —— 它需要 Microsoft 的链接器和
+Windows SDK 头文件，这些只存在于 Windows 上。所以必须在 Windows runner 上原生
+编译。（`x86_64-pc-windows-gnu` 可以经 mingw-w64 交叉编译，但 msvc 是 Rust 在
+Windows 上的默认且测试最充分的 ABI。）
+
+### 内容要点
+
+* `TARGET: x86_64-pc-windows-msvc`，job 级 `env`，避免多处硬编码
+* 版本号规则与 Linux 一致：tag 去掉 `v`，非 tag 用 `GITHUB_SHA` 前 7 位
+* **二进制缺失直接报错退出**（`.exe` 必须存在），文档缺失则跳过 —— 与 Linux 一致
+* sha256 文件用 `[System.IO.File]::WriteAllText` 写成 `<hash>  <name>` 加单个
+  LF，与 `sha256sum` 输出格式一致，两种平台的校验方式相同
+* `RUSTFLAGS: -C strip=symbols`，不需要 `+aes` —— `aes` crate 在 x86_64 上是
+  **运行时**检测 AES-NI，与 x86_64 Linux 同理
+
+### 平台相关代码已确认可编译
+
+新增 Windows target 前核对了各处的 `cfg` 门控，非 Unix 路径都有 fallback：
+
+* `net.rs::arm_tcp_reset` 是 `#[cfg(unix)]`；`tune_stream` / `tune_socket` 有
+  `#[cfg(not(target_os = "linux"))]` 分支（只做普通缓冲区设置）
+* `ConnAbort.fd`（`OwnedFd`）字段、`with_fd()`、`fire()` 里的 dup 逻辑全部
+  `#[cfg(unix)]` 门控，且 accept 处有 `#[cfg(not(unix))]` 的 `ConnAbort::new()`
+* `Cargo.toml` 已有 `[target.'cfg(windows)'.dependencies] windows-sys`（IP Helper
+  API 策略路由）；`libc` 在 Windows 上可编译，调用点均已门控
+
+**代价**：Windows 上 **FORCE RESET 退化为普通关闭**（发 FIN 而非 RST），因为
+`SO_LINGER` 的 abortive close 用的是 Unix 的 fd 语义。反探测功能仅在
+Linux/macOS 上完整生效。
+
+### 运行时注意事项
+
+* Windows 创建 TUN 适配器**需要管理员权限**，请以管理员身份运行
+* 若启动时报找不到 `wintun.dll`，把它与 `.exe` 放在同一目录（可从 wintun.net 获取）
+
 ## 批量 I/O：摊薄每次 hand-off 的固定成本
 
 ### 先说清楚：批量能省什么、不能省什么
