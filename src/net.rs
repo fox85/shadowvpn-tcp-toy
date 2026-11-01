@@ -119,15 +119,30 @@ pub const TCP_CC_NAME: &str = "bbr";
 /// Capping it makes the socket report "not writable" while only a small amount
 /// is genuinely unsent, which pushes backpressure upstream into our own queues
 /// where we can see it and react to it (see [`crate::transport`]'s subflow
-/// selection). Small enough to keep latency honest, large enough to keep the
-/// pipe full.
-/// 512 KiB, not 32 KiB: the cap is on bytes queued but not yet handed to the
-/// NIC, so too small a value makes the socket report "not writable" while the
-/// pipe still has room and the writer task cannot feed it fast enough — the
-/// path then idles between app writes. 512 KiB is ~8 ms of data at 500 Mbit/s,
-/// frequent enough to stay responsive and deep enough to keep the pipe full.
-/// Lower it (toward 64 KiB) only if latency matters more than throughput.
-pub const TCP_NOTSENT_LOWAT_BYTES: u32 = 512 * 1024;
+/// selection).
+///
+/// ## Do NOT scale this with the window
+///
+/// An earlier version derived it as `window / 8` clamped to 512 KiB, reasoning
+/// that a larger window needs a larger watermark to keep the pipe full. That is
+/// backwards:
+///
+/// * **Filling the pipe is the congestion window's job** (BBR/CUBIC decide how
+///   much may be *in flight*, unacknowledged). The watermark governs something
+///   else entirely — bytes sitting in the kernel that have not been handed to
+///   the NIC yet — and every one of those bytes is pure queueing delay that the
+///   inner protocol measures as extra RTT.
+/// * So a large watermark does not buy throughput; it only buys latency. At a
+///   32 MiB window it produced a 512 KiB queue, i.e. **41 ms of extra latency
+///   at 100 Mbit/s and 82 ms at 50 Mbit/s** — which is exactly the "QUIC feels
+///   laggy" symptom: it is not short of bandwidth, it is measuring an inflated
+///   RTT and backing off.
+/// * It also destroys the subflow scheduler's congestion signal. Backlog is our
+///   own queue, which stays empty while the kernel happily absorbs writes, so a
+///   stalling subflow looks healthy and keeps receiving packets.
+///
+/// Keep it small and fixed. 16 KiB is ~1.3 ms at 100 Mbit/s.
+pub const TCP_NOTSENT_LOWAT_BYTES: u32 = 16 * 1024;
 
 /// `TCP_CONGESTION` / `TCP_NOTSENT_LOWAT` option numbers on Linux.
 ///
@@ -332,10 +347,10 @@ fn tune_tcp_linux(fd: std::os::fd::RawFd, window: usize) {
                 }
             }
         }
-        // Cap unsent bytes so the send queue stays shallow. Scale it with the
-        // window: a fixed 512 KiB against a 1 MiB window would be half the pipe,
-        // and against a 32 MiB window it would needlessly idle the writer.
-        let lowat: u32 = (window / 8).clamp(64 * 1024, TCP_NOTSENT_LOWAT_BYTES as usize) as u32;
+        // Cap unsent bytes so the send queue stays shallow — deliberately NOT
+        // derived from `window`: see TCP_NOTSENT_LOWAT_BYTES for why scaling it
+        // with the window turns into pure queueing delay.
+        let lowat: u32 = TCP_NOTSENT_LOWAT_BYTES;
         let rc = libc::setsockopt(
             fd,
             libc::IPPROTO_TCP,

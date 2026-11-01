@@ -38,7 +38,7 @@ use log::{debug, error, info, warn};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use shadowvpn::batch::{fan_out, BATCH_MAX, BATCH_RECV, BATCH_SPIN};
+use shadowvpn::batch::{fan_out, Batcher, BATCH_MAX, BATCH_RECV, BATCH_SPIN};
 use shadowvpn::assign::{Assigner, Lease};
 use shadowvpn::config::{ServerArgs, ServerConfig};
 use shadowvpn::crypto::{decrypt_into, decrypt_packet, encrypt_into};
@@ -548,6 +548,10 @@ async fn udp_to_tun(
                 max_datagram_size(cipher) + obfs::MAX_HEADER
             };
             let pool = Arc::new(BufPool::new(buf_len, workers * 4, workers * 32));
+            // Adaptive batching: only wait for more packets while batches are
+            // actually filling, so one-at-a-time interactive traffic is not
+            // taxed with a spin it gains nothing from.
+            let mut batcher = Batcher::default();
             loop {
                 // Block for the first packet: idle waiting costs nothing here.
                 let mut buf = pool.take();
@@ -561,7 +565,7 @@ async fn udp_to_tun(
                 // Then drain whatever else is already queued, up to a batch.
                 // Under load this fills instantly; when traffic is sparse the
                 // spin timeout ships the short batch almost immediately.
-                while batch.len() < BATCH_MAX {
+                while batch.len() < BATCH_MAX && batcher.should_wait() {
                     let mut extra = pool.take();
                     match tokio::time::timeout(
                         BATCH_SPIN,
@@ -581,6 +585,7 @@ async fn udp_to_tun(
                     }
                 }
 
+                batcher.record(batch.len());
                 for (slot, group) in fan_out(workers, batch)
                     .into_iter()
                     .enumerate()
@@ -848,6 +853,7 @@ async fn tun_to_udp(
         let tun = Arc::clone(&tun);
         let pool = Arc::new(BufPool::new(MAX_IP_PACKET, workers * 4, workers * 32));
         tasks.spawn(async move {
+            let mut batcher = Batcher::default();
             loop {
                 let mut buf = pool.take();
                 let n = tun
@@ -859,7 +865,7 @@ async fn tun_to_udp(
                 let mut batch = vec![(slot, buf)];
 
                 // Drain whatever else the device already has queued.
-                while batch.len() < BATCH_MAX {
+                while batch.len() < BATCH_MAX && batcher.should_wait() {
                     let mut extra = pool.take();
                     match tokio::time::timeout(BATCH_SPIN, tun.recv(extra.as_mut_slice())).await {
                         Ok(Ok(n)) => {
@@ -872,6 +878,7 @@ async fn tun_to_udp(
                     }
                 }
 
+                batcher.record(batch.len());
                 for (slot, group) in fan_out(workers, batch)
                     .into_iter()
                     .enumerate()

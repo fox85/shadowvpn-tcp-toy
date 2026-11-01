@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 
-use shadowvpn::batch::{fan_out, BATCH_MAX, BATCH_RECV, BATCH_SPIN};
+use shadowvpn::batch::{fan_out, Batcher, BATCH_MAX, BATCH_RECV, BATCH_SPIN};
 use shadowvpn::config::{ClientArgs, ClientConfig, TunConfig};
 use shadowvpn::crypto::{decrypt_into, encrypt_into, encrypt_packet, Cipher};
 use shadowvpn::magic::{apply_push, PeerTable};
@@ -607,6 +607,9 @@ async fn tun_to_net(
         let assigned_ok = Arc::clone(&assigned_ok);
         let pool = Arc::new(BufPool::new(MAX_IP_PACKET, workers * 4, workers * 32));
         tasks.spawn(async move {
+        // Adaptive batching: only wait for more packets while batches are
+        // actually filling, so one-at-a-time interactive traffic is not taxed.
+        let mut batcher = Batcher::default();
         loop {
             // Recycled buffer: the hot path allocates and copies nothing.
             let mut buf = pool.take();
@@ -627,7 +630,7 @@ async fn tun_to_net(
             let mut batch = vec![(slot, buf)];
 
             // Drain whatever else the device already has queued.
-            while batch.len() < BATCH_MAX {
+            while batch.len() < BATCH_MAX && batcher.should_wait() {
                 let mut extra = pool.take();
                 let r = tokio::time::timeout(BATCH_SPIN, tun_reader.recv(extra.as_mut_slice()))
                     .await;
@@ -649,6 +652,7 @@ async fn tun_to_net(
                 }
             }
 
+            batcher.record(batch.len());
             for (slot, group) in fan_out(workers, batch)
                 .into_iter()
                 .enumerate()
@@ -827,6 +831,7 @@ async fn net_to_tun(
         // Consecutive transient receive failures (see `is_transient_udp_error`):
         // warn once when a burst starts, then stay quiet until it clears.
         let mut recv_failures: u64 = 0;
+        let mut batcher = Batcher::default();
         loop {
             // Batch: block for the first frame, then top up without waiting so
             // a burst moves as one hand-off instead of one wakeup per packet.
@@ -858,7 +863,7 @@ async fn net_to_tun(
             // Top up without blocking. The future is dropped by the end of the
             // `let`, which releases the borrow of `b` — so `b` can be moved
             // into the batch (or returned to the pool) below.
-            while batch.len() < BATCH_MAX {
+            while batch.len() < BATCH_MAX && batcher.should_wait() {
                 let mut b = pool.take();
                 let ready = tokio::time::timeout(BATCH_SPIN, socket.recv_sharded(b.as_mut_slice()))
                     .await;
@@ -874,6 +879,7 @@ async fn net_to_tun(
                     Ok(Err(_)) | Err(_) => break,
                 }
             }
+            batcher.record(batch.len());
             for (slot, group) in fan_out(workers, batch).into_iter().enumerate() {
                 if group.is_empty() {
                     continue;

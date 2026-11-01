@@ -190,7 +190,21 @@ pub const TCP_BACKLOG: u32 = 1024;
 /// Per-connection outbound queue depth, and the depth of the hub's aggregated
 /// inbound channel. Bounded so a stalled peer applies backpressure instead of
 /// growing the heap without limit.
-pub const TCP_CHANNEL_DEPTH: usize = 1024;
+///
+/// ## Why this must stay small
+///
+/// This queue is **latency**, not throughput: a packet enqueued behind `n`
+/// others waits `n x MTU / rate` before it is even written. At the old 1024
+/// that is 1.5 MB — about **122 ms of queueing at 100 Mbit/s**. Latency-
+/// sensitive traffic inside the tunnel (QUIC, VoIP, games, interactive shells)
+/// measures that as RTT inflation and backs off, which reads as sluggishness
+/// even though the link is far from full.
+///
+/// 128 is ~190 KB, i.e. ~15 ms at 100 Mbit/s and ~1.5 ms at 1 Gbit/s — enough
+/// to absorb a scheduling hiccup, small enough not to dominate the RTT. It is
+/// also the signal [`backlog`] feeds to the subflow scheduler, so a shallow
+/// queue is what lets a stalling subflow be avoided *promptly*.
+pub const TCP_CHANNEL_DEPTH: usize = 128;
 
 /// Size of a connection's read buffer.
 ///
@@ -352,22 +366,25 @@ fn pick_subflow(backlogs: &[usize], hash: u32, spin: u32, ordered: bool) -> usiz
             .min_by_key(|i| backlogs[*i])
             .unwrap_or(target);
     }
-    // Among the least-loaded subflows, spread by `hash ^ spin`. `spin` changes
-    // every packet, which is what scatters a *single* flow: without it a flow's
-    // constant hash would pin it to one index even when every subflow is idle,
-    // and pinning is the thing we are trying to avoid. Mixing rather than
-    // replacing the hash keeps different flows from colliding on the same
-    // subflow, so the spread stays even across many flows too.
-    let min = backlogs.iter().copied().min().unwrap_or(0);
-    let tied = backlogs.iter().filter(|b| **b == min).count().max(1);
-    let k = ((hash ^ spin) % tied as u32) as usize;
-    backlogs
-        .iter()
-        .enumerate()
-        .filter(|(_, b)| **b == min)
-        .nth(k)
-        .map(|(i, _)| i)
-        .unwrap_or(0)
+    // Rotate in runs like the ordered case, then spread by `hash ^ spin` among
+    // the eligible subflows. `spin` changes every run, which is what scatters a
+    // *single* flow: without it a flow's constant hash would pin it to one
+    // index even when every subflow is idle, and pinning is what we are trying
+    // to avoid. Mixing rather than replacing the hash keeps different flows from
+    // colliding on the same subflow, so the spread stays even across many flows.
+    //
+    // Unlike the ordered case, "eligible" now means *below a backlog
+    // threshold* rather than "exactly the minimum": a subflow that is merely
+    // slow (congested but draining) would otherwise stay tied-for-least and
+    // keep receiving packets that all arrive late.
+    let target = ((hash ^ spin) % n as u32) as usize;
+    if backlogs[target] != DEAD && backlogs[target] <= UNORDERED_SPILL_BACKLOG {
+        return target;
+    }
+    (0..n)
+        .filter(|i| backlogs[*i] != DEAD)
+        .min_by_key(|i| backlogs[*i])
+        .unwrap_or(target)
 }
 
 /// How many consecutive packets an unordered flow keeps on one subflow before
@@ -395,7 +412,18 @@ fn pick_subflow(backlogs: &[usize], hash: u32, spin: u32, ordered: bool) -> usiz
 ///
 /// Set to `1` to restore per-packet round-robin (only useful if the receiver is
 /// genuinely reorder-proof), or raise it if a specific application is sensitive.
-pub const UDP_ROTATE_EVERY: u32 = 16;
+/// Packets per rotation run for unordered (inner UDP/QUIC) flows.
+///
+/// Smaller than [`TCP_ROTATE_EVERY`] because QUIC tolerates reordering far
+/// better than TCP does: it carries explicit packet numbers and ACK ranges, so
+/// out-of-order arrival is normal operation rather than a loss signal. What it
+/// cannot tolerate is a *gap in time* — a head-of-line stall on one subflow
+/// reads as a catastrophic RTT spike, fires the probe timeout, and collapses
+/// the congestion window.
+///
+/// So for UDP the trade is skewed the other way: rotate sooner (4, was 16) so
+/// fewer packets sit behind any single stall.
+pub const UDP_ROTATE_EVERY: u32 = 4;
 
 /// How many consecutive packets an **ordered** flow (inner TCP) keeps on one
 /// subflow before rotating to the next. `0` restores strict pinning.
@@ -452,6 +480,18 @@ pub const DEFAULT_ORDERED_ROTATE: u32 = 0;
 /// about to add latency to every packet in the run, so past this point moving
 /// is the lesser evil.
 pub const ORDERED_SPILL_BACKLOG: usize = 32;
+
+/// Backlog at which an **unordered** flow abandons its current subflow for the
+/// least loaded one.
+///
+/// Unordered flows were previously scheduled purely by "pick the least loaded,
+/// tie-break by hash": correct while every subflow reports 0, but a subflow
+/// whose socket is congested yet still draining slowly stays eligible, so a
+/// QUIC flow keeps feeding the one connection that is behind. Giving unordered
+/// traffic an explicit spill threshold — a lower one than ordered traffic gets,
+/// since it can absorb the resulting reordering — is what keeps its latency
+/// from tracking the worst subflow.
+pub const UNORDERED_SPILL_BACKLOG: usize = 8;
 
 /// Rotation epoch for subflow selection: `counter / every`.
 ///
@@ -2046,6 +2086,27 @@ mod tests {
         // A different flow starts from zero, unaffected by the first one.
         assert_eq!(t.next(0xbbbb), 1);
         assert_eq!(t.next(0xbbbb), 2);
+    }
+
+    /// An unordered flow (QUIC) abandons a slow subflow rather than letting its
+    /// latency track the worst one.
+    #[test]
+    fn unordered_flow_spills_when_slow() {
+        // Subflow 2 is congested but still draining, so a pure "least loaded"
+        // rule would still consider it if everything else were busier. Here the
+        // explicit threshold must exclude it.
+        let backlogs = [0usize, 0, UNORDERED_SPILL_BACKLOG + 1, 0];
+        let idx = pick_subflow(&backlogs, 0, rotation_epoch(0, UDP_ROTATE_EVERY), false);
+        assert_ne!(idx, 2, "fed the slow subflow");
+    }
+
+    /// Unordered flows rotate sooner than ordered ones: QUIC reorders fine but
+    /// cannot tolerate a stall, so fewer packets should sit behind any one.
+    #[test]
+    fn unordered_rotates_sooner_than_ordered() {
+        assert!(UDP_ROTATE_EVERY < 16, "unordered runs should be short");
+        // Sanity: with a run of `UDP_ROTATE_EVERY` packets the epoch advances.
+        assert_eq!(rotation_epoch(UDP_ROTATE_EVERY, UDP_ROTATE_EVERY), 1);
     }
 
     /// An ordered flow abandons a backed-up subflow rather than queueing.
