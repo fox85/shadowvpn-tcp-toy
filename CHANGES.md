@@ -559,6 +559,98 @@ sudo tcpdump -i any -nn 'host <ip> and port 6543 and tcp[tcpflags] & tcp-push !=
 
 这样下次不用抓包，启动日志里就能直接核对两端是否一致。
 
+## 32 MiB 窗口下的稳定性修正：峰值 540、多数 200、均值 280
+
+### 症状指向什么
+
+「偶尔冲到 540，多数时候掉回 200，均值 280」不是带宽不够 —— 峰值证明链路能跑
+540。这是**周期性坍缩**：内层 TCP 反复把窗口砍半。32 MiB 窗口下 `window / RTT`
+早已不是瓶颈（66 ms 时约 4 Gbit/s），所以坍缩只能来自**丢包或乱序**。
+
+### 根因一：轮转计数器是全局的（真 bug）
+
+上一版让有序流量按段轮转，但 `spins` 是**一个**全局 `AtomicU32`：
+
+```rust
+let spin = rotation_epoch(self.spins.fetch_add(1, ...), hint.ordered);
+```
+
+每个包都让这个全局计数器 +1。于是 **N 条并发流时，任一条流的 epoch 前进速度是
+单独运行时的 N 倍** —— 配置「每 64 个包换一次」，实际几乎是**每包都换**。
+
+后果正是有序流量最怕的：连续乱序 → 重复 ACK → 虚假快速重传 → 窗口砍半 → 掉回
+200 Mbps。而且**流越多越严重**，这直接解释了「开启子流反而更慢」—— 子流带来
+更多可以选择的连接，全局计数器把所有流一起搅乱。
+
+**修正**：新增 `SpinTable`，64 个独立计数器按 `flow_hash % 64` 分片，每条流只推进
+自己的计数器。碰撞仅让两条流略快轮转，无害。
+
+### 根因二：窗口够大时轮转是纯负担
+
+轮转存在的唯一理由，是突破**单条子流**的 `window / RTT` 上限。现在窗口是
+32 MiB：
+
+| 配置 | 单流上限（66 ms RTT） |
+| --- | --- |
+| `tcp_window_mb = 4` | ~500 Mbit/s → **需要轮转** |
+| `tcp_window_mb = 32` | ~4 Gbit/s → **轮转只剩代价** |
+
+**所以默认改为 `TCP_ROTATE_EVERY = 0`（钉住）**：零乱序，上限由你配的窗口决定。
+钉住不等于死板 —— 子流积压超过 `ORDERED_SPILL_BACKLOG (32)` 时仍会改投最空闲的
+一条，所以真正的拥塞依然能绕开。
+
+**新增 `tcp_rotate_every` 配置项**（CLI `--tcp-rotate-every`，JSON 同名字段），
+默认 0。只有在窗口已无法再调大、而 `window / RTT` 仍是瓶颈时才设它（64 起步）。
+
+```json
+{ "transport": "tcp", "tcp_window_mb": 32, "tcp_rotate_every": 0 }
+```
+
+### 根因三：BBR 可能根本没生效
+
+代码请求 BBR，但内核没加载 `tcp_bbr`、容器禁止切换、或 qdisc 不是 `fq` 时，
+`setsockopt` **静默失败**，实际仍跑 CUBIC —— 一个丢段砍半窗口，正是这个波形。
+
+**修正**：设置后用 `getsockopt(TCP_CONGESTION)` **读回实际值**，不是 BBR 就 `warn`：
+
+```
+WARN TCP congestion control is "cubic", not bbr: loss-based CC halves its
+     window on a single dropped segment, which is exactly the 'peaks then
+     falls back' pattern...
+```
+
+### 附带改进
+
+* 启动横幅新增 `ordered flows : PINNED to one subflow (no reordering)`，
+  不用猜当前是钉住还是轮转
+* 新增测试：轮转默认钉住、`SpinTable` 按流隔离（`spin_table_is_per_flow`）
+* `TCP_NOTSENT_LOWAT` 随窗口缩放（上一版已有），32 MiB 下取上限 512 KiB
+
+### 达标 1000 Mbps 的硬性检查清单
+
+按顺序确认，前三项任一不满足就到不了：
+
+1. **窗口真的生效了** —— 看启动横幅；有窗口告警说明 `SO_*BUFFORCE` 没拿到
+   `CAP_NET_ADMIN`，用 root 跑或按前文调 `rmem_max` / `wmem_max`。
+   注意 `tcp_rmem[2]` / `tcp_wmem[2]`（默认 6 MiB / 4 MiB）也会封顶。
+2. **BBR 真的生效** —— 看上面那条 warn；另用 `ss -ti` 确认出现 `bbr`，
+   且 qdisc 是 `fq`（`tc qdisc show`）。BBR 配其他队列表现很差。
+3. **RTT** —— `ss -ti` 读实际 RTT，按 `window / RTT` 核对目标是否物理可达。
+   1000 Mbps 需要：10 ms → 1.2 MiB；66 ms → 8.3 MiB；180 ms → 22.5 MiB。
+4. **丢包率** —— 单流在 30 ms RTT 下要到 1000 Mbps，Mathis 公式要求
+   `p ≈ 1.5×10⁻⁷`，即约每 660 万个包才丢一个。**这条最苛刻**：路径上若有
+   任何稳定丢包，单流不可能稳定维持 1000 Mbps，只能靠多子流分散风险。
+5. **BBR 的 PROBE_RTT** —— BBR 每约 10 秒进入一次 PROBE_RTT（200 ms，
+   cwnd 降到 4 个包）。这是协议固有行为，会造成短促周期性凹陷；
+   若平均速率受影响明显，可考虑改用 `bbr2`/`bbr3`（新内核）对比。
+
+### 关于「子流不叠加」
+
+修正全局计数器后，多子流对**多条并发内层流**应当有叠加效果（按 hash 分散）。
+但对**单条**内层流，钉住意味着只用一条子流 —— 这是换取零乱序的代价，
+在窗口足够大时是划算的（上限已达 4 Gbit/s）。若确实要让单条流吃满多子流，
+设 `tcp_rotate_every: 64`，接受一定的乱序。
+
 ## 单流（subflows=1）能否突破 500 Mbps？
 
 ### 直接答案：能，但有硬条件，且这个条件不由代码决定

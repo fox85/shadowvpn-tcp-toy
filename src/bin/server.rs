@@ -379,6 +379,7 @@ async fn run(cfg: ServerConfig) -> Result<()> {
                 plausible: shadowvpn::transport::plausible_frame_limit(cfg.tun.mtu),
                 padding: cfg.padding,
                 window: cfg.tcp_window,
+                rotate_ordered: cfg.tcp_rotate_every,
                 // Server-side: no reconnecting to do, so these are unused.
                 reconnect_interval: 0,
                 reconnect_max: 0,
@@ -1376,6 +1377,14 @@ fn print_banner(cfg: &ServerConfig, tun_name: &str) {
         shadowvpn::config::report_padding(cfg.padding);
         // `window / RTT` is a hard ceiling for any single client connection.
         shadowvpn::net::log_single_stream_ceiling(cfg.tcp_window);
+        if cfg.tcp_rotate_every == 0 {
+            info!("  ordered flows : PINNED to one subflow (no reordering)");
+        } else {
+            info!(
+                "  ordered flows : rotate every {} packets (adds reordering)",
+                cfg.tcp_rotate_every
+            );
+        }
         if cfg.nat {
             // NAT mode can't tell "two connections from one client" from "two
             // clients", so a multi-subflow client would get two internal IPs.

@@ -140,6 +140,14 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
         // With `subflows = 1` this is the number that decides whether a target
         // rate is reachable at all, so print it rather than make people guess.
         shadowvpn::net::log_single_stream_ceiling(cfg.tcp_window);
+        if cfg.tcp_rotate_every == 0 {
+            info!("ordered flows  : PINNED to one subflow (no reordering)");
+        } else {
+            info!(
+                "ordered flows  : rotate every {} packets (adds reordering)",
+                cfg.tcp_rotate_every
+            );
+        }
     }
     if cfg.cipher.is_none() {
         // Loud on purpose: `cipher=none` sends IP packets in the clear, and that
@@ -196,6 +204,7 @@ async fn run(mut cfg: ClientConfig) -> Result<()> {
                 plausible: MAX_TCP_FRAME, // we trust the server we dialled
                 padding: cfg.padding,
                 window: cfg.tcp_window,
+                rotate_ordered: cfg.tcp_rotate_every,
                 reconnect_interval: cfg.reconnect_interval,
                 reconnect_max: cfg.reconnect_max,
             },

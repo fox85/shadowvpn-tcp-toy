@@ -301,6 +301,36 @@ fn tune_tcp_linux(fd: std::os::fd::RawFd, window: usize) {
                     std::io::Error::last_os_error()
                 );
             }
+
+            // Read back what the kernel actually selected. A kernel without
+            // BBR (or a container that forbids switching) silently keeps the
+            // default, and "throughput spikes to 500 Mbit/s then collapses to
+            // 200" is otherwise unanswerable — the code looks correct and the
+            // symptom looks like a bug elsewhere.
+            let mut buf = [0u8; 32];
+            let mut len = buf.len() as libc::socklen_t;
+            let grc = libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                linux_tcp::TCP_CONGESTION,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+            );
+            if grc == 0 {
+                let got = std::str::from_utf8(&buf[..len as usize])
+                    .unwrap_or("")
+                    .trim_end_matches('\0')
+                    .to_string();
+                if got != TCP_CC_NAME {
+                    log::warn!(
+                        "TCP congestion control is \"{got}\", not {TCP_CC_NAME}: \
+                         loss-based CC halves its window on a single dropped segment, \
+                         which is exactly the 'peaks then falls back' pattern. Check \
+                         that tcp_bbr is loaded and that net.ipv4.tcp_congestion_control \
+                         and net.core.default_qdisc=fq are set (or run as root)"
+                    );
+                }
+            }
         }
         // Cap unsent bytes so the send queue stays shallow. Scale it with the
         // window: a fixed 512 KiB against a 1 MiB window would be half the pipe,

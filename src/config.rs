@@ -42,7 +42,7 @@ use crate::policy::{Mode, PolicyConfig};
 use crate::pool::host_range;
 use crate::protocol::{DEFAULT_TUN_MTU, DEFAULT_TUN_MTU_TCP};
 use crate::net::{DEFAULT_TCP_WINDOW_MB, MAX_TCP_WINDOW_MB};
-use crate::transport::{DEFAULT_PADDING_MAX, MAX_PADDING};
+use crate::transport::{DEFAULT_ORDERED_ROTATE, DEFAULT_PADDING_MAX, MAX_PADDING};
 use crate::state::default_client_state_path;
 
 /// Default cipher used when none is specified.
@@ -265,6 +265,12 @@ pub struct FileConfig {
     /// ceiling: `rate <= window / RTT`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tcp_window_mb: Option<usize>,
+
+    /// Packets per rotation run for ordered (inner TCP) flows. `0` pins each
+    /// flow to one subflow — the stable default. Raise it only if
+    /// `window / RTT` is the binding constraint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tcp_rotate_every: Option<u32>,
 
     /// Seconds between TCP reconnect attempts (client only). `0` uses the
     /// default.
@@ -495,6 +501,8 @@ pub struct ServerConfig {
     pub padding: usize,
     /// TCP socket buffer per subflow, in bytes (`tcp_window_mb` resolved).
     pub tcp_window: usize,
+    /// Packets per rotation run for ordered flows; `0` pins.
+    pub tcp_rotate_every: u32,
     /// Packet-processing workers per direction (AEAD + routing).
     pub workers: usize,
     /// Negotiated AEAD cipher (`Cipher::None` disables encryption).
@@ -543,6 +551,8 @@ pub struct ClientConfig {
     pub workers: usize,
     /// TCP socket buffer per subflow, in bytes (`tcp_window_mb` resolved).
     pub tcp_window: usize,
+    /// Packets per rotation run for ordered flows; `0` pins.
+    pub tcp_rotate_every: u32,
     /// Seconds between TCP reconnect attempts; `0` uses the default.
     pub reconnect_interval: u64,
     /// Consecutive failed reconnects before giving up; `0` retries forever.
@@ -623,6 +633,11 @@ pub struct ServerArgs {
     /// long-RTT paths (also raise net.core.rmem_max / wmem_max).
     #[arg(long = "tcp-window-mb", value_name = "MB")]
     pub tcp_window_mb: Option<usize>,
+
+    /// Packets per rotation run for ordered (inner TCP) flows (default 0,
+    /// i.e. pinned). Raise only if `window / RTT` is the limiter.
+    #[arg(long = "tcp-rotate-every", value_name = "N")]
+    pub tcp_rotate_every: Option<u32>,
 
     /// Explicit TUN interface name.
     #[arg(long = "tun-name")]
@@ -738,6 +753,11 @@ pub struct ClientArgs {
     /// long-RTT paths (also raise net.core.rmem_max / wmem_max).
     #[arg(long = "tcp-window-mb", value_name = "MB")]
     pub tcp_window_mb: Option<usize>,
+
+    /// Packets per rotation run for ordered (inner TCP) flows (default 0,
+    /// i.e. pinned). Raise only if `window / RTT` is the limiter.
+    #[arg(long = "tcp-rotate-every", value_name = "N")]
+    pub tcp_rotate_every: Option<u32>,
 
 
     /// Seconds to wait between TCP reconnect attempts (default 5).
@@ -1378,6 +1398,10 @@ impl ServerArgs {
         let transport = resolve_transport(self.transport.or(file.transport))?;
         let padding = resolve_padding(self.padding.or(file.padding), transport)?;
         let tcp_window = resolve_tcp_window(self.tcp_window_mb.or(file.tcp_window_mb))?;
+        let tcp_rotate_every = self
+            .tcp_rotate_every
+            .or(file.tcp_rotate_every)
+            .unwrap_or(DEFAULT_ORDERED_ROTATE);
         let workers = crate::worker_count(self.workers.or(file.workers));
 
         let (cipher, master_key) =
@@ -1458,6 +1482,7 @@ impl ServerArgs {
             transport,
             padding,
             tcp_window,
+            tcp_rotate_every,
             workers,
             cipher,
             master_key,
@@ -1494,6 +1519,10 @@ impl ClientArgs {
         let subflows = resolve_subflows(self.subflows.or(file.subflows), transport)?;
         let padding = resolve_padding(self.padding.or(file.padding), transport)?;
         let tcp_window = resolve_tcp_window(self.tcp_window_mb.or(file.tcp_window_mb))?;
+        let tcp_rotate_every = self
+            .tcp_rotate_every
+            .or(file.tcp_rotate_every)
+            .unwrap_or(DEFAULT_ORDERED_ROTATE);
         let workers = crate::worker_count(self.workers.or(file.workers));
         // `0` means "unset" for the interval (use the default), but means
         // "retry forever" for the attempt cap — so both stay as written and
@@ -1551,6 +1580,7 @@ impl ClientArgs {
             subflows,
             padding,
             tcp_window,
+            tcp_rotate_every,
             workers,
             reconnect_interval: reconnect_interval.unwrap_or(0),
             reconnect_max: reconnect_max.unwrap_or(0),
@@ -1668,6 +1698,7 @@ mod tests {
                 padding: None,
                 workers: None,
                 tcp_window_mb: None,
+                tcp_rotate_every: None,
                 reconnect_interval: None,
                 reconnect_max: None,
                 tun_name: None,
@@ -1713,6 +1744,7 @@ mod tests {
                 padding: None,
                 workers: None,
                 tcp_window_mb: None,
+                tcp_rotate_every: None,
                 reconnect_interval: None,
                 reconnect_max: None,
                 tun_name: None,
@@ -1756,6 +1788,7 @@ mod tests {
             padding: None,
             workers: None,
             tcp_window_mb: None,
+            tcp_rotate_every: None,
             reconnect_interval: None,
             reconnect_max: None,
             tun_name: Some("utun9".to_string()),
@@ -1905,6 +1938,24 @@ mod tests {
                 "should reject {bad}"
             );
         }
+    }
+
+    /// Ordered-flow rotation defaults to **pinned**: rotation buys throughput
+    /// only when `window / RTT` is the limiter, and costs reordering (which
+    /// inner TCP reads as loss) otherwise.
+    #[test]
+    fn tcp_rotate_default_is_pinned() {
+        assert_eq!(DEFAULT_ORDERED_ROTATE, 0);
+        let args = ClientArgs {
+            config: None,
+            server: Some("host:1".to_string()),
+            password: Some("pw".to_string()),
+            transport: Some("tcp".to_string()),
+            tun_ip: Some(Ipv4Addr::new(10, 0, 0, 2)),
+            peer_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            ..ClientArgs::empty()
+        };
+        assert_eq!(args.resolve().unwrap().tcp_rotate_every, 0);
     }
 
     /// The bound below which padding stops being worth anything. A capture
@@ -2257,6 +2308,7 @@ mod tests {
             padding: None,
             workers: None,
             tcp_window_mb: None,
+            tcp_rotate_every: None,
             reconnect_interval: None,
             reconnect_max: None,
             tun_name: None,
@@ -2348,6 +2400,7 @@ mod tests {
             padding: None,
             workers: None,
             tcp_window_mb: None,
+            tcp_rotate_every: None,
             reconnect_interval: None,
             reconnect_max: None,
             tun_name: None,

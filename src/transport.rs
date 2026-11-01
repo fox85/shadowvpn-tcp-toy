@@ -421,7 +421,28 @@ pub const UDP_ROTATE_EVERY: u32 = 16;
 /// accepting the single-subflow ceiling); lower it toward
 /// [`UDP_ROTATE_EVERY`] if the subflows have very similar RTTs and you want a
 /// more even spread.
-pub const TCP_ROTATE_EVERY: u32 = 64;
+/// Default is **0 (pinned)**: see the rationale in
+/// [`DEFAULT_ORDERED_ROTATE`]. Only enable it when `window / RTT` is actually
+/// the binding constraint.
+pub const TCP_ROTATE_EVERY: u32 = 0;
+
+/// Default configured value for ordered-flow rotation.
+///
+/// Rotation exists to lift the `window / RTT` ceiling that a single subflow
+/// imposes on one inner TCP connection. It costs reordering, which inner TCP
+/// reads as loss. So it is only worth paying when the window really is the
+/// limiter:
+///
+/// * `tcp_window_mb = 4`, RTT 180 ms → ceiling ~186 Mbit/s → rotation helps.
+/// * `tcp_window_mb = 32`, RTT 66 ms → ceiling ~4 Gbit/s → rotation is pure
+///   cost, and is the usual cause of "peaks at 500 Mbit/s then falls back to
+///   200".
+///
+/// Default 0 (pinned) therefore gives the *stable* behaviour: no reordering,
+/// and the ceiling is set by the window you configured. Raise it (64 is a
+/// reasonable start) only if you are window/RTT-limited and cannot enlarge the
+/// window further.
+pub const DEFAULT_ORDERED_ROTATE: u32 = 0;
 
 /// Backlog (queued frames) at which an ordered flow abandons its current
 /// subflow for the least loaded one.
@@ -432,21 +453,65 @@ pub const TCP_ROTATE_EVERY: u32 = 64;
 /// is the lesser evil.
 pub const ORDERED_SPILL_BACKLOG: usize = 32;
 
-/// Per-packet rotation epoch for subflow selection: `counter / every`, where
-/// `every` depends on whether the flow tolerates reordering.
+/// Rotation epoch for subflow selection: `counter / every`.
 ///
-/// A `0` divisor would trap, so `every == 0` means "never rotate" rather than
-/// "rotate every packet".
-fn rotation_epoch(counter: u32, ordered: bool) -> u32 {
-    let every = if ordered {
-        TCP_ROTATE_EVERY
-    } else {
-        UDP_ROTATE_EVERY
-    };
+/// `every == 0` means "never rotate" (a `0` divisor would trap), which is
+/// distinct from "rotate every packet".
+fn rotation_epoch(counter: u32, every: u32) -> u32 {
     if every == 0 {
         0
     } else {
         counter / every
+    }
+}
+
+/// Rotation period for one packet, given whether it needs ordering.
+fn rotate_every(ordered_every: u32, unordered_every: u32, ordered: bool) -> u32 {
+    if ordered {
+        ordered_every
+    } else {
+        unordered_every
+    }
+}
+
+/// Number of independent rotation counters.
+const SPIN_SLOTS: usize = 64;
+
+/// Per-flow rotation counters.
+///
+/// ## Why not one global counter
+///
+/// A single global `fetch_add` advances once per packet *across all flows*, so
+/// any individual flow's epoch changes far more often than `every` — with a
+/// hundred concurrent flows a flow nominally rotating every 64 packets actually
+/// rotates almost every packet. That is precisely the continuous reordering
+/// inner TCP punishes (duplicate ACKs, spurious fast retransmit, halved window),
+/// and it is why enabling rotation could make throughput *worse*.
+///
+/// Indexed by `flow_hash % SPIN_SLOTS` so a flow advances its own counter. Two
+/// flows sharing a slot merely rotate somewhat faster than configured, which is
+/// harmless.
+pub struct SpinTable {
+    slots: [AtomicU32; SPIN_SLOTS],
+}
+
+impl SpinTable {
+    pub fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
+
+    /// Advance `flow_hash`'s counter by one and return the value to use.
+    pub fn next(&self, flow_hash: u32) -> u32 {
+        let i = (flow_hash % SPIN_SLOTS as u32) as usize;
+        self.slots[i].fetch_add(1, Ordering::Relaxed).wrapping_add(1)
+    }
+}
+
+impl Default for SpinTable {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -482,6 +547,9 @@ pub struct TcpOptions {
     /// the single setting that caps throughput, because
     /// `rate <= window / RTT`; see [`crate::net::DEFAULT_TCP_WINDOW_MB`].
     pub window: usize,
+    /// Packets per rotation run for **ordered** (inner TCP) flows. `0` pins.
+    /// See [`DEFAULT_ORDERED_ROTATE`] for when rotation is worth its cost.
+    pub rotate_ordered: u32,
     /// Seconds to wait between reconnect attempts. `0` means
     /// [`DEFAULT_RECONNECT_INTERVAL`].
     pub reconnect_interval: u64,
@@ -1198,9 +1266,8 @@ pub struct TcpHub {
     aborts: RwLock<HashMap<SocketAddr, Arc<ConnAbort>>>,
     /// Per-connection settings; see [`TcpOptions`].
     opts: TcpOptions,
-    /// Monotonic counter mixed into unordered subflow selection (see
-    /// [`pick_subflow`]).
-    spins: AtomicU32,
+    /// Per-flow rotation counters; see [`SpinTable`].
+    spins: SpinTable,
 }
 
 impl TcpHub {
@@ -1216,7 +1283,7 @@ impl TcpHub {
             outbound: RwLock::new(HashMap::new()),
             aborts: RwLock::new(HashMap::new()),
             opts,
-            spins: AtomicU32::new(0),
+            spins: SpinTable::new(),
         });
 
         let hub2 = Arc::clone(&hub);
@@ -1373,8 +1440,8 @@ impl TcpHub {
                 Some(h) if peers.len() > 1 => {
                     // Same epoch division as the client's `send_hint`.
                     let spin = rotation_epoch(
-                        self.spins.fetch_add(1, Ordering::Relaxed),
-                        h.ordered,
+                        self.spins.next(h.hash),
+                        rotate_every(self.opts.rotate_ordered, UDP_ROTATE_EVERY, h.ordered),
                     );
                     let backlogs: Vec<usize> =
                         peers.iter().map(|p| backlog(outbound.get(p))).collect();
@@ -1437,9 +1504,11 @@ pub struct TcpClient {
     outbound: Slots,
     /// Number of parallel connections this client maintains.
     subflows: usize,
-    /// Monotonic counter mixed into unordered subflow selection so one flow's
-    /// packets rotate across subflows instead of pinning to one.
-    spins: AtomicU32,
+    /// Per-flow rotation counters; see [`SpinTable`] for why these cannot be a
+    /// single global counter.
+    spins: SpinTable,
+    /// Packets per rotation run for ordered (inner TCP) flows; `0` pins.
+    rotate_ordered: u32,
 }
 
 impl TcpClient {
@@ -1493,7 +1562,8 @@ impl TcpClient {
             inbound: Mutex::new(inbound_rx),
             outbound: Arc::clone(&outbound),
             subflows,
-            spins: AtomicU32::new(0),
+            spins: SpinTable::new(),
+            rotate_ordered: opts.rotate_ordered,
         });
 
         for (idx, reader) in readers.into_iter().enumerate() {
@@ -1611,7 +1681,10 @@ impl TcpClient {
         // Divide so `spin` only changes every UDP_ROTATE_EVERY / TCP_ROTATE_EVERY
         // packets: see those constants for why a per-packet counter is
         // counter-productive, and why ordered flows rotate at all.
-        let spin = rotation_epoch(self.spins.fetch_add(1, Ordering::Relaxed), hint.ordered);
+        let spin = rotation_epoch(
+            self.spins.next(hint.hash),
+            rotate_every(self.rotate_ordered, UDP_ROTATE_EVERY, hint.ordered),
+        );
         // One lock acquisition, not two: picking the subflow and taking its
         // sender both need the same snapshot, and this is per-packet.
         let tx = {
@@ -1922,40 +1995,57 @@ mod tests {
     const TEST_PLAUSIBLE: usize = 4096;
 
     /// A `0` divisor must mean "never rotate", not "rotate every packet" —
-    /// the latter would divide by zero.
+    /// the latter would divide by zero. The default is 0, i.e. pinned.
     #[test]
     fn rotation_epoch_zero_never_rotates() {
-        assert_eq!(rotation_epoch(0, true), 0);
-        assert_eq!(rotation_epoch(12345, true), 0);
+        assert_eq!(TCP_ROTATE_EVERY, 0, "default must stay pinned");
+        assert_eq!(rotation_epoch(0, 0), 0);
+        assert_eq!(rotation_epoch(12345, 0), 0);
     }
 
     /// Ordered flows rotate far more slowly than unordered ones, which is what
     /// keeps a run intact and reordering confined to run boundaries.
     #[test]
     fn rotation_epoch_ordered_is_slower() {
-        // 0..UDP_ROTATE_EVERY-1 is epoch 0 for unordered, but still 0 for
-        // ordered well past UDP_ROTATE_EVERY.
-        assert_eq!(rotation_epoch(UDP_ROTATE_EVERY, false), 1);
-        assert_eq!(rotation_epoch(UDP_ROTATE_EVERY, true), 0);
-        assert_eq!(rotation_epoch(TCP_ROTATE_EVERY, true), 1);
+        assert_eq!(rotation_epoch(UDP_ROTATE_EVERY, UDP_ROTATE_EVERY), 1);
+        // 64 unordered packets is epoch 4; the same count of ordered packets
+        // (at the default `every`) is still epoch 0.
+        assert_eq!(rotation_epoch(UDP_ROTATE_EVERY, 0), 0);
+        assert_eq!(rotation_epoch(64, 64), 1);
     }
 
     /// An ordered flow changes subflow only when its epoch changes: several
     /// packets in a row land on the same one.
     #[test]
     fn ordered_flow_holds_a_run() {
+        const EVERY: u32 = 64;
         let backlogs = [0usize, 0, 0, 0];
-        let first = pick_subflow(&backlogs, 0x1234, rotation_epoch(0, true), true);
-        for c in 1..TCP_ROTATE_EVERY {
+        let first = pick_subflow(&backlogs, 0x1234, rotation_epoch(0, EVERY), true);
+        for c in 1..EVERY {
             assert_eq!(
-                pick_subflow(&backlogs, 0x1234, rotation_epoch(c, true), true),
+                pick_subflow(&backlogs, 0x1234, rotation_epoch(c, EVERY), true),
                 first,
                 "run broke at packet {c}"
             );
         }
         // The next epoch is allowed to move (it need not, but it must not be
         // pinned for ever).
-        let _ = pick_subflow(&backlogs, 0x1234, rotation_epoch(TCP_ROTATE_EVERY, true), true);
+        let _ = pick_subflow(&backlogs, 0x1234, rotation_epoch(EVERY, EVERY), true);
+    }
+
+    /// Two different flows must not share a rotation counter: if they did, the
+    /// combined traffic would advance the counter once per packet across both
+    /// flows and each would rotate far more often than configured — which is
+    /// the reordering that collapses inner TCP's window.
+    #[test]
+    fn spin_table_is_per_flow() {
+        let t = SpinTable::new();
+        for _ in 0..10 {
+            t.next(0xaaaa);
+        }
+        // A different flow starts from zero, unaffected by the first one.
+        assert_eq!(t.next(0xbbbb), 1);
+        assert_eq!(t.next(0xbbbb), 2);
     }
 
     /// An ordered flow abandons a backed-up subflow rather than queueing.
@@ -1975,6 +2065,7 @@ mod tests {
             plausible: TEST_PLAUSIBLE,
             padding: 0,
             window: 4 * 1024 * 1024,
+            rotate_ordered: DEFAULT_ORDERED_ROTATE,
             reconnect_interval: interval,
             reconnect_max: max,
         }
